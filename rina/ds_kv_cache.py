@@ -86,6 +86,12 @@ class DSKVCacheStore:
     1-bit encoding.  Used for critical layers (first/last) where
     quantization error propagates disproportionately."""
 
+    # ── FWHT mode (§8.1.11) ────────────────────────────────────────────
+    use_fwht: bool = False
+    """If True, FWHT was applied during encoding; IFWHT must be applied
+    during decode.  Persisted from config so reconstruct_all can
+    correctly invert the Walsh-Hadamard transform."""
+
     # ── Calibration (noise shaping) ──
     svd_shaper: Optional[Dict] = None
 
@@ -473,6 +479,7 @@ class DSKVCacheStore:
                 mat_primary = decode_from_bases(
                     bases, self.alphas, self.orig_shape, tile_size=tile_size,
                     recon_weights=self.recon_weights,
+                    use_fwht=self.use_fwht,
                 )
 
                 if use_differential and self.bases_residual is not None and self.diff_gamma > 0:
@@ -481,6 +488,7 @@ class DSKVCacheStore:
                         bases_res = bases_res[..., :self.bases_shape_M_residual]
                     mat_residual = decode_from_bases(
                         bases_res, self.alphas_residual, self.orig_shape, tile_size=tile_size,
+                        use_fwht=self.use_fwht,
                     )
                     mat = mat_primary + self.diff_gamma * mat_residual
                 else:
@@ -599,6 +607,8 @@ def _encode_single_path(
         initial_momentum=initial_momentum,
         initial_integrator2=initial_integrator2,
         return_momentum=return_momentum,
+        use_fwht=cfg.use_fwht,
+        zero_mean_integrator2=cfg.zero_mean_integrator2,
     )
 
     if cfg.adaptive_n:
@@ -607,7 +617,8 @@ def _encode_single_path(
         # adaptive_encode_matrix doesn't accept momentum/tracker kwargs
         adaptive_kwargs = {
             k: v for k, v in encode_kwargs.items()
-            if k not in ("initial_momentum", "initial_integrator2", "return_momentum")
+            if k not in ("initial_momentum", "initial_integrator2", "return_momentum",
+                         "use_fwht", "zero_mean_integrator2")
         }
         result = adaptive_encode_matrix(
             mat,
@@ -742,14 +753,16 @@ def encode_kv_cache(
     v_bases_res, v_alphas_res, v_shape_res = None, None, None
 
     if cfg.use_differential and cfg.diff_strategy == "residual":
-        k_hat_primary = decode_from_bases(k_bases, k_alphas, k_shape, tile_size=cfg.tile_size)
+        k_hat_primary = decode_from_bases(k_bases, k_alphas, k_shape, tile_size=cfg.tile_size,
+                                          use_fwht=cfg.use_fwht)
         k_residual = k_enc - k_hat_primary
         k_bases_res, k_alphas_res, k_shape_res = encode_matrix(
             k_residual, n_steps=cfg.diff_residual_n_steps, tile_size=cfg.tile_size,
             beta=cfg.beta, proj_matrix=None, proj_beta=0.0, adaptive_eta=False,
         )
 
-        v_hat_primary = decode_from_bases(v_bases, v_alphas, v_shape, tile_size=cfg.tile_size)
+        v_hat_primary = decode_from_bases(v_bases, v_alphas, v_shape, tile_size=cfg.tile_size,
+                                          use_fwht=cfg.use_fwht)
         v_residual = v_enc - v_hat_primary
         v_bases_res, v_alphas_res, v_shape_res = encode_matrix(
             v_residual, n_steps=cfg.diff_residual_n_steps, tile_size=cfg.tile_size,
@@ -772,6 +785,7 @@ def encode_kv_cache(
         diff_gamma=cfg.get_diff_residual_gamma_k() if cfg.use_differential else 0.0,
         cross_token_group=group_k,
         original_n_tokens=n_tokens_original,
+        use_fwht=cfg.use_fwht,
     )
     # Store pad tokens for unreshape
     k_store._cross_token_pad = k_pad  # type: ignore
@@ -790,6 +804,7 @@ def encode_kv_cache(
         v_rotation_matrix=v_rotation,
         cross_token_group=group_v,
         original_n_tokens=n_tokens_original,
+        use_fwht=cfg.use_fwht,
     )
     v_store._cross_token_pad = v_pad  # type: ignore
 

@@ -1,0 +1,5 @@
+label,n_steps_k,n_steps_v,proj_beta,diff_residual_gamma,order2_gamma,use_fwht,zero_mean_integrator2,cross_head_error_share,num_tokens_generated,first_divergence,token_match_rate,compression_ratio,ds_memory_mb,elapsed_s
+H_baseline,4,6,0.3,0.25,0.25,False,False,False,80,5,0.1477,1.67,1.63,7.45
+I_fwht,4,6,0.3,0.25,0.25,True,False,False,80,1,0.1023,1.67,1.63,13.66
+J_fwht_zm,4,6,0.3,0.25,0.25,True,True,False,80,1,0.1023,1.67,1.63,10.23
+K_full,4,6,0.3,0.25,0.25,True,True,True,80,1,0.1023,1.67,1.63,9.91

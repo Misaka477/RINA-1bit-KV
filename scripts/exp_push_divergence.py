@@ -1,18 +1,23 @@
 #!/usr/bin/env python
 """
-Phase 3 — 推迟首步发散的 4-way 精度优化实验 (v3)
-================================================
+Phase 3 — 三维正交化攻击：FWHT / Integrator均值归零 / 跨头分流 (v4)
+==================================================================
 对 Llama 3.2 1B 跑 4 组配置，每组记录：
   - first_divergence_position
   - token_match_rate
   - compression_ratio
   - mean CosSim (K/V)
 
-实验组:
-    A. baseline       — 当前最优 (cross_token_group=4, order2_gamma=0.3, recon_weights, cross_head_share)
-    B. pyramid_protect — baseline + protected_layers=[0,15] 锁定首尾层为FP16
-    C. adaptive_combo  — baseline + layer_step_pyramid + beta_decay (0.30→0.05 over 10 tokens)
-    D. full_stack      — B + C 全开
+三维正交方向:
+    1. FWHT:    tile → Walsh-Hadamard 旋转 → 平坦频谱 → Σ-Δ 量化器零陷对准
+    2. ZeroMean: integrator2 直流归零 → 二阶 Σ-Δ AC coupling
+    3. CrossHead: 跨 KV head 传递 Σ-Δ 动量 → GQA 误差分流
+
+实验矩阵:
+    H_baseline:  FWHT ✗  ZeroMean ✗  CrossHead ✗
+    I_fwht:      FWHT ✓  ZeroMean ✗  CrossHead ✗
+    J_fwht_zm:   FWHT ✓  ZeroMean ✓  CrossHead ✗
+    K_full:      FWHT ✓  ZeroMean ✓  CrossHead ✓
 
 用法:
     python scripts/exp_push_divergence.py
@@ -139,10 +144,9 @@ def run_single_config(
         "proj_beta": cfg.proj_beta,
         "diff_residual_gamma": cfg.diff_residual_gamma,
         "order2_gamma": cfg.order2_gamma,
-        "cross_token_group": cfg.cross_token_group,
-        "protected_layers": str(cfg.protected_layers),
-        "layer_step_map": "on" if cfg.layer_step_map else "off",
-        "beta_decay": "on" if cfg.beta_decay_tokens > 0 else "off",
+        "use_fwht": cfg.use_fwht,
+        "zero_mean_integrator2": cfg.zero_mean_integrator2,
+        "cross_head_error_share": cfg.cross_head_error_share,
         "num_tokens_generated": gen_tokens,
         "first_divergence": first_div,
         "token_match_rate": round(token_match_rate, 4),
@@ -153,7 +157,7 @@ def run_single_config(
 
 
 def main():
-    p = argparse.ArgumentParser(description="4-way precision optimization experiment (v3)")
+    p = argparse.ArgumentParser(description="Phase 3 Orthogonal Attack Experiment (v4)")
     p.add_argument("--model", type=str, default="D:/Software_Development/Project/models/Llama-3.2-1B")
     p.add_argument("--prompt", type=str, default="The future of artificial intelligence lies in")
     p.add_argument("--max-tokens", type=int, default=80)
@@ -164,11 +168,13 @@ def main():
     p.add_argument("--n-steps-v", type=int, default=5)
     p.add_argument("--beta", type=float, default=0.15)
     p.add_argument("--tile-size", type=int, default=16)
-    p.add_argument("--no-ns", action="store_false", dest="use_ns", default=True)
-    p.add_argument("--no-diff", action="store_false", dest="use_diff", default=True)
+    p.add_argument("--no-ns", action="store_false", dest="use_ns")
+    p.add_argument("--no-diff", action="store_false", dest="use_diff")
     p.add_argument("--diff-gamma", type=float, default=0.25)
     p.add_argument("--v-ortho", action="store_true", default=True, dest="v_ortho")
     p.add_argument("--no-v-ortho", action="store_false", dest="v_ortho")
+    p.add_argument("--n-steps-k-base", type=int, default=4, help="K path steps for baseline configs")
+    p.add_argument("--n-steps-v-base", type=int, default=6, help="V path steps for baseline configs")
 
     args = p.parse_args()
 
@@ -196,14 +202,18 @@ def main():
         tokenizer.pad_token = tokenizer.eos_token
     hf_model.eval()
 
-    # ── Define 4 experimental configs (v3) ──
+    # ── Define 4 experimental configs (v4 — Phase 3 orthogonal attack) ──
 
     def _base_config(**overrides):
-        """Build base config from CLI args + overrides."""
-        from rina.config import _default_layer_step_map
+        """Build base config from CLI args + overrides.
+
+        Phase 3 baseline: everything that competes with the three orthogonal
+        dimensions is OFF.  Noise shaping and differential residual are kept
+        as they are orthogonal infrastructure.
+        """
         kwargs = {
-            "n_steps_k": args.n_steps_k,
-            "n_steps_v": args.n_steps_v,
+            "n_steps_k": args.n_steps_k_base,
+            "n_steps_v": args.n_steps_v_base,
             "tile_size": args.tile_size,
             "beta": args.beta,
             "use_noise_shaping": args.use_ns,
@@ -213,17 +223,25 @@ def main():
             "use_differential": args.use_diff,
             "diff_strategy": "residual",
             "diff_residual_gamma": args.diff_gamma,
-            "diff_residual_n_steps": 2,
+            "diff_residual_n_steps": 1,
             "v_orthogonal_transform": args.v_ortho,
-            "order2_gamma": 0.3,
-            "cross_token_group": 4,
+            # ── C3 optimal: second-order Σ-Δ disabled (zero drift avoidance) ──
+            "order2_gamma": 0.0,
+            "order2_c1": 1.0,
+            "order2_c2": 0.5,
+            # ── All three Phase-3 dimensions OFF in C3 baseline ──
+            "use_fwht": False,
+            "zero_mean_integrator2": False,
+            "cross_head_error_share": False,
+            # ── Disable extras that confound the orthogonal test ──
+            "cross_token_group": 1,
             "protected_layers": [],
-            "use_recon_weights": True,
-            "cross_head_error_share": True,
-            "layer_step_map": None,  # None = use config default (pyramid)
+            "use_recon_weights": False,
+            "layer_step_map": None,
             "beta_decay_start": 0.30,
             "beta_decay_end": 0.05,
-            "beta_decay_tokens": 0,  # off by default, enabled in C/D
+            "beta_decay_tokens": 0,
+            "dynamic_tile_size": False,
             "base_dtype": "fp16",
             "verbose": False,
         }
@@ -232,33 +250,25 @@ def main():
 
     configs = []
 
-    # A: baseline — current best config
-    cfg_a = _base_config()
-    configs.append(("A_baseline", cfg_a))
+    # H: pure baseline — all three dimensions OFF
+    cfg_h = _base_config()
+    configs.append(("H_baseline", cfg_h))
 
-    # B: pyramid_protect — baseline + protected first/last layers
-    cfg_b = _base_config(protected_layers=[0, 15])
-    configs.append(("B_pyramid_protect", cfg_b))
+    # I: FWHT only — energy diffusion via Walsh-Hadamard rotation
+    cfg_i = _base_config(use_fwht=True)
+    configs.append(("I_fwht", cfg_i))
 
-    # C: adaptive_combo — baseline + layer_step_pyramid + beta_decay
-    from rina.config import _default_layer_step_map
-    cfg_c = _base_config(
-        layer_step_map=_default_layer_step_map(),
-        beta_decay_start=0.30,
-        beta_decay_end=0.05,
-        beta_decay_tokens=10,
+    # J: FWHT + ZeroMean — energy diffusion + integrator DC removal
+    cfg_j = _base_config(use_fwht=True, zero_mean_integrator2=True)
+    configs.append(("J_fwht_zm", cfg_j))
+
+    # K: full stack — all three dimensions ON
+    cfg_k = _base_config(
+        use_fwht=True,
+        zero_mean_integrator2=True,
+        cross_head_error_share=True,
     )
-    configs.append(("C_adaptive_combo", cfg_c))
-
-    # D: full_stack — B + C
-    cfg_d = _base_config(
-        protected_layers=[0, 15],
-        layer_step_map=_default_layer_step_map(),
-        beta_decay_start=0.30,
-        beta_decay_end=0.05,
-        beta_decay_tokens=10,
-    )
-    configs.append(("D_full_stack", cfg_d))
+    configs.append(("K_full", cfg_k))
 
     # ── Run experiments ──
     results = []
@@ -266,11 +276,10 @@ def main():
         _logger.info(f"\n{'='*60}")
         _logger.info(f"  Running: {label}")
         _logger.info(f"  n_steps_k={cfg.get_n_steps_k()}, n_steps_v={cfg.get_n_steps_v()}, "
-                     f"beta={cfg.beta}, order2_gamma={cfg.order2_gamma}, "
-                     f"cross_token_group={cfg.cross_token_group}")
-        _logger.info(f"  protected_layers={cfg.protected_layers}, "
-                     f"layer_step_map={'on' if cfg.layer_step_map else 'off'}, "
-                     f"beta_decay={'on' if cfg.beta_decay_tokens > 0 else 'off'}")
+                     f"beta={cfg.beta}, order2_gamma={cfg.order2_gamma}")
+        _logger.info(f"  FWHT={'Y' if cfg.use_fwht else 'N'}, "
+                     f"ZeroMean={'Y' if cfg.zero_mean_integrator2 else 'N'}, "
+                     f"CrossHead={'Y' if cfg.cross_head_error_share else 'N'}")
         _logger.info(f"{'='*60}")
 
         result = run_single_config(
@@ -285,19 +294,19 @@ def main():
 
     # ── Summary ──
     _logger.info(f"\n{'='*70}")
-    _logger.info("  SUMMARY — 4-way Push Divergence Experiment (v3)")
+    _logger.info("  SUMMARY — Phase 3 Orthogonal Attack Experiment (v4)")
     _logger.info(f"{'='*70}")
-    header = (f"{'Label':<22} {'nk':>3} {'nv':>3} {'o2g':>5} {'ctg':>3} "
-              f"{'protect':>9} {'step_map':>8} {'b_decay':>8} "
+    header = (f"{'Label':<18} {'nk':>3} {'nv':>3} {'fwht':>5} {'zmi2':>5} {'xhead':>6} "
               f"{'1st_div':>8} {'match':>8} {'comp':>5}")
     _logger.info(header)
     _logger.info("-" * len(header))
     for r in results:
-        beta_str = str(r.get("beta_decay", "off"))
+        fwht_str = "Y" if r.get("use_fwht") else "N"
+        zmi2_str = "Y" if r.get("zero_mean_integrator2") else "N"
+        xhead_str = "Y" if r.get("cross_head_error_share") else "N"
         _logger.info(
-            f"{r['label']:<22} {r['n_steps_k']:>3} {r['n_steps_v']:>3} "
-            f"{r['order2_gamma']:>5.2f} {r['cross_token_group']:>3} "
-            f"{r['protected_layers']:>9} {r['layer_step_map']:>8} {beta_str:>8} "
+            f"{r['label']:<18} {r['n_steps_k']:>3} {r['n_steps_v']:>3} "
+            f"{fwht_str:>5} {zmi2_str:>5} {xhead_str:>6} "
             f"{str(r['first_divergence']):>8} {r['token_match_rate']:>8.4f} "
             f"{r['compression_ratio']:>4.1f}x"
         )
@@ -308,8 +317,8 @@ def main():
         output_path.parent.mkdir(parents=True, exist_ok=True)
         fieldnames = [
             "label", "n_steps_k", "n_steps_v", "proj_beta", "diff_residual_gamma",
-            "order2_gamma", "cross_token_group", "protected_layers", "layer_step_map",
-            "beta_decay", "num_tokens_generated", "first_divergence",
+            "order2_gamma", "use_fwht", "zero_mean_integrator2", "cross_head_error_share",
+            "num_tokens_generated", "first_divergence",
             "token_match_rate", "compression_ratio", "ds_memory_mb", "elapsed_s",
         ]
         with open(output_path, "w", newline="") as f:

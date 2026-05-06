@@ -32,10 +32,10 @@ class DSKVCacheConfig:
     """Tile dimension for block-wise encoding.  Must match GPU Tensor Core
     alignment (16 recommended)."""
 
-    beta: float = 0.10
+    beta: float = 0.15
     """First-order Σ-Δ momentum coefficient.  0 → no momentum, 0.10–0.20
     provides mild noise shaping that reduces per-step error accumulation.
-    Kept moderate (≤0.15) when order2_gamma > 0 to avoid overshoot (§8.4.2)."""
+    C3 optimal — 0.15 provides moderate shaping without overshoot."""
 
     # ── Noise shaping (Whitepaper §8.1) ────────────────────────────────
     use_noise_shaping: bool = True
@@ -54,9 +54,9 @@ class DSKVCacheConfig:
     """Ramp proj_beta from 0→peak linearly across encoding steps (§8.1.1)."""
 
     # ── Second-order Σ-Δ (§8.1.2) ─────────────────────────────────────
-    order2_gamma: float = 0.3
+    order2_gamma: float = 0.0
     """Second integrator coupling strength.  0 = first-order only.
-    0.2-0.5 for higher-order noise shaping."""
+    C3 optimal: disable second-order to avoid integrator drift."""
 
     order2_c1: float = 1.0
     """First integrator gain coefficient."""
@@ -74,11 +74,28 @@ class DSKVCacheConfig:
     Recommended: 4 for long sequences, 2 for <512 tokens."""
 
     # ── V orthogonal transform (§8.1.4 — Google-style "energy dispersion") ──
-    v_orthogonal_transform: bool = False
+    v_orthogonal_transform: bool = True
     """Apply an orthogonal rotation to V before encoding, constructed from
     Q's SVD right-singular vectors.  This disperses V's outlier-heavy
     distribution before 1-bit quantisation, analogous to Google's rotary
     transform for V-path compression."""
+
+    # ── FWHT Walsh-Hadamard transform (§8.1.11) ────────────────────────
+    use_fwht: bool = False
+    """Apply Fast Walsh-Hadamard Transform to each tile before residual pursuit.
+    Rotates circuit-space tile vectors into Walsh basis, spreading outlier energy
+    evenly across frequencies so the Σ-Δ quantizer sees a flat spectrum.
+    Zero-cost on GPU (only addition/subtraction, no multiplications).
+    Phase 3 experiment shows FWHT degrades match_rate (0.1477→0.1023): Σ-Δ
+    depends on structured energy distribution that FWHT destroys.
+    Set False — revert to differential residual baseline which achieves 0.193+."""
+
+    zero_mean_integrator2: bool = False
+    """Remove DC component from the second-order Σ-Δ integrator after each step.
+    Prevents integrator DC drift from saturating downstream stages, analogous to
+    AC coupling in analog Σ-Δ modulators.  Has no effect when order2_gamma=0.
+    Phase 3 experiment shows no benefit when combined with FWHT; set False
+    to revert to differential residual baseline configuration."""
 
     # ── Per-layer adaptive step allocation (§8.1.6) ───────────────────
     layer_step_map: Optional[dict] = field(default_factory=lambda: _default_layer_step_map())
@@ -132,16 +149,17 @@ class DSKVCacheConfig:
     diff_strategy: str = "residual"
     """Differential cancellation strategy: 'residual' or 'cancellation'."""
 
-    diff_residual_n_steps: int = 2
-    """Number of 1-bit bases for residual stage."""
+    diff_residual_n_steps: int = 1
+    """Number of 1-bit bases for residual stage.
+    C3 optimal: single step avoids over-correction."""
 
-    diff_residual_gamma: float = 0.7
+    diff_residual_gamma: float = 0.25
     """Blending coefficient for residual stage (V path).
-    0.7 means 70% of residual correction is applied."""
+    C3 optimal: 0.25 avoids over-correction that amplifies quantization noise."""
 
-    diff_residual_gamma_k: float = 0.3
+    diff_residual_gamma_k: float = 0.25
     """Blending coefficient for residual stage (K path).
-    Lower than V because K error propagates more directly."""
+    C3 optimal: matched to V for symmetric correction."""
 
     # ── Adaptive N scheduling (Whitepaper §8.1.3) ──────────────────────
     adaptive_n: bool = False

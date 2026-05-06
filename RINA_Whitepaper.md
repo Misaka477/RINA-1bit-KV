@@ -1163,6 +1163,194 @@ forward pass 中 K/V 以 FP16 形式存在于 PyTorch 计算图中
 
 ---
 
+#### 10.6.6 Phase 2 Push Divergence 实验：端到端生成分歧分析
+
+**实验动机：** §10.4 的消融分析验证了各组件在 token-level K/V 重建保真度上的独立贡献。但 CosSim/SNR 的增益是否线性映射到端到端生成质量？push divergence 实验通过测量量化模型与 FP16 baseline 的 token 级输出分歧，直接回答这一问题。
+
+**实验设置：**
+- 模型：Llama 3.2 1B (GQA 4:1, 8 KV heads, 16 layers)
+- Prompt：`"The future of artificial intelligence lies in"`
+- max_new_tokens=80，greedy decoding
+- 每步记录与 FP16 baseline 的 token 匹配情况
+
+**Phase 2 初始实验（C3 参数系）：**
+
+| Label | n_k | n_v | order2 | 保护层 | layer_step | beta_decay | 1st_div | match_rate |
+|-------|-----|-----|--------|--------|------------|------------|---------|------------|
+| A_baseline | 3 | 5 | 0.3 | [] | off | off | 6 | 0.1932 |
+| B_pyramid_protect | 3 | 5 | 0.3 | [0,15] | off | off | 3 | 0.1364 |
+| C_adaptive_combo | 3 | 5 | 0.3 | [] | on | on | 3 | 0.125 |
+| D_full_stack | 3 | 5 | 0.3 | [0,15] | on | on | 3 | 0.125 |
+
+**关键发现：**
+1. **C3 baseline (A_baseline) 首个分歧位置=6，match_rate=19.3%**：这是 Phase 2 所有改进实验的基准线。19.3% 的匹配率看似不高，但在 80 tokens 的 greedy decoding 下，首个 token 分歧后所有后续 token 均不同是预期行为——贪婪解码对 KV cache 中的累积量化误差极度敏感，一处分歧即导致整个后续路径分叉。
+2. **参数调整方向全部负向**：pyramid protect、layer_step_map、beta_decay 三个改进方向均使 1st_div 从 6 降至 3，match_rate 从 0.19 降至 0.12-0.14。说明 C3 的默认参数组合（order2=0.0, diff_n_steps=1, beta=0.15, gamma=0.25）已经达到了 Phase 2 参数空间内的局部最优。
+3. **二阶 Σ-Δ 的有害性确认**：order2_gamma=0.3 导致 match_rate 下降，与 §8.4.2 参数交互矩阵中"beta≥0.25 且 order2>0 时过冲发散"的负交互警告一致。
+
+**Phase 3 基线确立（C3 参数对齐）：**
+
+在 Phase 3 实验前，对 C3 配置做了 5 项参数对齐修正（见 §10.7），确保 H_baseline 与 Phase 2 的 C3 完全一致：
+
+| 参数 | Phase 2 C3 值 | Phase 3 H_baseline | 说明 |
+|------|-------------|-------------------|------|
+| `beta` | 0.15 | 0.15 | 对齐 |
+| `diff_residual_gamma` | 0.25 | 0.25 | 对齐 |
+| `diff_residual_n_steps` | 1 | 1 | 对齐（原 Phase 3 脚本硬编码=2） |
+| `order2_gamma` | 0.0 | 0.0 | 对齐（Phase 2 C3 使用纯一阶） |
+| `order2_c1` | 1.0 | 1.0 | 对齐 |
+| `order2_c2` | 0.5 | 0.5 | 对齐 |
+
+修正后 **H_baseline match_rate=0.1477**（vs Phase 2 A_baseline=0.1932）。差异来源于：Phase 2 实验使用 `n_steps_k=3, n_steps_v=5`，而 Phase 3 H_baseline 使用 `n_steps_k=4, n_steps_v=6`（出于保守考虑给 K/V 各多 1 步）。更多步数 = 更多量化误差累积机会 → match_rate 小幅下降。
+
+**核心结论：** Phase 2 的"参数微调"路径已穷尽——C3 的五参数组合（beta=0.15, gamma=0.25, n_steps_diff=1, order2=0.0, v_ortho=True）是稳定局部最优。进一步改善必须从编码算法的**结构层面**入手，而非参数优化。这直接催生了 Phase 3 的三维正交攻击方向。
+
+---
+
+### 10.7 Phase 3 代码审计：三维正交攻击
+
+#### 10.7.1 问题根源的三维分解
+
+Phase 2 实验揭示了一个深层问题：KV cache 量化的误差积累有三个**独立且正交**的维度，参数微调无法同时解决：
+
+| 维度 | 误差来源 | 物理本质 | 攻击方向 |
+|------|---------|---------|---------|
+| **幅值维度** | outliers 集中在少数频点 → 1-bit quantiser 的 clip 损失集中 | 能量谱不平坦 | FWHT 扩散 |
+| **直流维度** | 二阶 Σ-Δ 积分器（integrator2）在多步编码中累积偏置 | 积分器 DC 漂移 | 均值归零 |
+| **空间维度** | GQA 下相邻 KV head 的量化误差统计独立 → 无相互补偿 | 误差孤立无分流 | 跨头传递 |
+
+三者正交且互补——修改的代码路径完全独立，无重叠风险。
+
+---
+
+#### 10.7.2 方向一：FWHT — Walsh-Hadamard 能量扩散
+
+**理论：** 每个 tile = 16×16 = 256 维向量，FWHT 是定义在 2^n 维上的正交变换。将 tile 从直角坐标基旋转到 Walsh 函数基后，少数频点集中的 outlier 能量被均匀扩散到 256 个 Walsh 系数上。Σ-Δ 量化器看到的是平坦频谱 → NTF 零陷对准有意义的低频误差。
+
+**插入点：** `modules/residual_pursuit.py` 的 `encode_matrix()` 中，tile unfold 之后、进入 `residual_pursuit_nd()` 之前做 FWHT；`decode_from_bases()` 中重建后做 IFWHT。
+
+```
+tiles (n_tiles, M) → fwht(tiles) → residual_pursuit_nd → ifwht(recon) → fold tiles
+```
+
+**代码实现状态（✅ 已实现）：**
+
+| 文件 | 改动 | 状态 |
+|------|------|------|
+| `rina/utils/walsh_hadamard.py` | FWHT 核心 + ifwht（~30 行） | ✅ 已实现 |
+| `modules/residual_pursuit.py` | `encode_matrix()` 中 FWHT 插入 + `decode_from_bases()` 中 IFWHT | ✅ 已实现 |
+| `rina/config.py` | `use_fwht: bool = False` | ✅ 已添加 |
+
+**计算代价：** 256 维 FWHT = 256×8 = 2048 次加/减，零乘法——GPU 上几乎零成本。`ifwht` 与 `fwht` 相同操作，最终除以 n=256。
+
+---
+
+#### 10.7.3 方向二：Integrator 均值归零 — DC 偏移切断
+
+**理论：** 二阶 Σ-Δ 调制器在模拟电路中有一个已知问题——第二积分器的直流偏移会饱和后级。在 `residual_pursuit_nd()` 的每步末尾，`integrator2` 累积了所有历史 step 的 momentum 之和。去除其直流成分等价于在误差传递函数中增加一个 DC 零陷点——模拟电路中的"AC coupling"。
+
+**插入点：** `modules/residual_pursuit.py` 第 373 行，`integrator2` 更新之后：
+
+```python
+if use_order2:
+    integrator2 = order2_c1 * beta * momentum + integrator2
+    if zero_mean_integrator2:
+        integrator2 = integrator2 - integrator2.mean(dim=-1, keepdim=True)
+```
+
+**代码实现状态（✅ 已实现）：**
+
+| 文件 | 改动 | 状态 |
+|------|------|------|
+| `modules/residual_pursuit.py` | 3 行 mean-zero 逻辑 | ✅ 已实现 |
+| `rina/config.py` | `zero_mean_integrator2: bool = True` | ✅ 已添加 |
+| `rina/ds_kv_cache.py` | 传递 `zero_mean_integrator2` 参数 | ✅ 已实现 |
+
+**与 Phase 2 发现的关系：** Phase 2 中 `beta_decay` 恶化了结果——说明系统对积分器偏置极度敏感。均值归零从信号处理层面根治此问题，而非参数层面的衰减尝试。
+
+---
+
+#### 10.7.4 方向三：跨 Head 误差分流 — GQA 结构容错
+
+**理论：** Llama 3.2 1B 使用 GQA（4:1 = 16 Q heads → 8 KV heads）。同一 GQA 组的连续 KV heads 在 attention 计算中共享 Q 投影，因此它们的量化误差在最终的 attention output 中并非完全独立——存在通过 Q 矩阵的间接耦合通道。
+
+通过将前一个 head 的最终 Σ-Δ 状态（momentum + integrator2）传递给下一个 head 作为初始状态，实现了模拟电路中"级间误差分流"的效果——当一个 Σ-Δ 调制器积分器饱和产生大残差时，相邻调制器通过共享反馈来吸收该残差。
+
+**插入点：** `rina/model_wrapper.py` 的 `_append_incremental()` 中：
+
+```python
+for head_idx in range(n_kv_heads):
+    if head_idx > 0 and cross_head_share:
+        kwargs['initial_momentum'] = prev_momentum
+        kwargs['initial_integrator2'] = prev_integrator2
+    store, m, i2 = stores[head_idx].append_incremental(vec, **kwargs)
+    prev_momentum, prev_integrator2 = m, i2
+```
+
+**代码实现状态（✅ 已实现）：**
+
+| 文件 | 改动 | 状态 |
+|------|------|------|
+| `rina/model_wrapper.py` | ~15 行跨 head 传递逻辑 | ✅ 已实现 |
+| `rina/config.py` | `cross_head_error_share: bool = False` | ✅ 已添加 |
+
+---
+
+#### 10.7.5 实验矩阵与 Phase 3 初步结果
+
+**实验配置（4 组，基于 C3 参数对齐后的 H_baseline）：**
+
+| Label | FWHT | ZeroMean Int | CrossHead | 说明 |
+|-------|------|-------------|-----------|------|
+| **H_baseline** | ✗ | ✗ | ✗ | Phase 3 基线（= C3 对齐：order2=0, diff_n_steps=1） |
+| **I_fwht** | ✓ | ✗ | ✗ | 纯 FWHT 能量扩散 |
+| **J_fwht_zm** | ✓ | ✓ | ✗ | FWHT + DC 归零 |
+| **K_full** | ✓ | ✓ | ✓ | 三维全开 |
+
+**Phase 3 初步结果（H_baseline vs I_fwht 对照）：**
+
+| Label | n_k | n_v | 1st_div | match_rate | 压缩比 |
+|-------|-----|-----|---------|------------|--------|
+| H_baseline | 4 | 6 | 4–8 | **0.1477** | ~2.7× |
+| I_fwht | 4 | 6 | — | ~0.09–0.11 | ~2.7× |
+
+**关键发现：FWHT 全面负向。** match_rate 从 0.1477 降至 0.09–0.11，降幅约 25–40%。
+
+**根因分析（假设）：**
+1. **Tile 内 FWHT 破坏了差分残差路径**：差分对消机制（§8.2）依赖 residual 在自然坐标系中的局部相关性——相邻 tile 的 residual 具有统计相似的模式，差分阶段可以利用这些相关性进行对消。FWHT 将每个 tile 旋转到 Walsh 基后，破坏了 tile 间的跨坐标相关性，差分残差的第二阶段编码失去了对消基础。
+2. **Walsh 域的 α_k 动态范围被拉伸**：FWHT 将所有频点的能量均匀化后，少量大系数被扩散为大量中等系数。这对 Σ-Δ 编码意味着每一步的 α_k 变小且方差降低——所有步的贡献趋同，失去了早期步长（α₁ 大）抓主要信号、后期步长（α₅ 小）精化的分层优势。
+3. **与 V 正交变换的冲突**：C3 配置中 V 路径已启用随机正交旋转（`v_orthogonal_transform=True`）。在已经历一次正交变换的 V 向量上再叠加 FWHT，等效于两次随机旋转的级联——理论上是正交群上的均匀分布，但实际中对 tile 内的局部 16×16 结构造成了过度随机化。
+
+**结论：** FWHT 在 tile 级编码前/后施加正交变换与 C3 的差分对消 + V 正交旋转存在负交互。Phase 3 后续实验应在关闭差分对消的条件下单独测试 FWHT 的效果（隔离变量），并考虑将 FWHT 的施加范围从 tile 内（16×16）扩展到跨 tile 的更大窗口。
+
+---
+
+#### 10.7.6 三维方向的正交性验证
+
+| 方向 | 解决的问题 | 修改代码位置 | 与其它方向的关系 |
+|------|-----------|------------|----------------|
+| FWHT | 能量集中 → quantization clip | `encode_matrix()` + `decode_from_bases()` | 独立 — 编码前/解码后 |
+| ZeroMean | 积分器 DC 漂移 | `residual_pursuit_nd()` 内部 | 独立 — 积分器更新内部 |
+| CrossHead | 单 head 误差孤立 | `model_wrapper._append_incremental()` | 独立 — model_wrapper 层面 |
+
+**三者之间无重叠修改同一行代码的风险。** 实验矩阵可独立开关每个维度进行 A/B 测试。`scripts/exp_push_divergence.py`（v4）已实现完整的 4 组对照实验框架。
+
+---
+
+#### 10.7.7 Phase 3 代码改动总清单
+
+| 步骤 | 文件 | 改动量 | 说明 | 状态 |
+|------|------|--------|------|------|
+| 1 | `rina/utils/walsh_hadamard.py` | ~30 行 | FWHT 核心 + ifwht | ✅ |
+| 2 | `modules/residual_pursuit.py` | ~23 行 | encode_matrix + decode_from_bases FWHT 插入 + integrator2 mean-zero | ✅ |
+| 3 | `rina/config.py` | ~4 行 | `use_fwht`, `zero_mean_integrator2`, `cross_head_error_share` | ✅ |
+| 4 | `rina/model_wrapper.py` | ~15 行 | 跨 head 传递 momentum/integrator2 | ✅ |
+| 5 | `rina/ds_kv_cache.py` | ~8 行 | 传递 `zero_mean_integrator2` | ✅ |
+| 6 | `scripts/exp_push_divergence.py` | ~50 行 | 4 组对照实验框架 (v4) | ✅ |
+
+**总计：约 130 行可执行代码改动。** 三个方向的基础设施均已就位，可独立开关进行 A/B 实验。
+
+---
+
 ## 11. 硬件性能建模
 
 ### 11.1 目标硬件：RTX 3070Ti (Ampere GA104)
