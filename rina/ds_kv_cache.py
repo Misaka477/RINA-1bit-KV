@@ -579,33 +579,46 @@ class DSKVCacheStore:
         bases_M = bases.shape[-1]
         packed = pack_bases(bases)
 
-        # ── Primary reconstruction (used by differential AND adaptive bypass) ──
+        # ── Adaptive 1-bit Residual Correction ──
+        adaptive_residual = getattr(cfg, 'adaptive_residual', False)
         bypass_adaptive = getattr(cfg, 'bypass_adaptive', False)
-        need_primary = (cfg.use_differential and cfg.diff_strategy == "residual") or (bypass_adaptive and not self.protected)
+        use_legacy_residual = cfg.use_differential and cfg.diff_strategy == "residual"
+        need_primary = (
+            use_legacy_residual or
+            (bypass_adaptive and not self.protected) or
+            (adaptive_residual and not self.protected)
+        )
         if need_primary:
             primary = decode_from_bases(bases, alphas, shape, tile_size=tile_size)
 
-        # ── Adaptive bypass (Phase 1): record FP16 for tokens with high L∞ error ──
-        if bypass_adaptive and not self.protected:
-            bypass_threshold = getattr(cfg, 'bypass_threshold', 0.5)
-            cg = self.cross_token_group if self.cross_token_group >= 1 else 1
-            if cg > 1:
-                d_head_orig = tile.shape[1] // cg
-                tile_tokens = tile.reshape(-1, d_head_orig)
-                primary_tokens = primary.reshape(-1, d_head_orig)
-            else:
-                tile_tokens = tile
-                primary_tokens = primary
-            n_tokens_in_tile = min(tile_tokens.shape[0], n_real_tokens if n_real_tokens else tile_tokens.shape[0])
-            for i in range(n_tokens_in_tile):
-                err = (tile_tokens[i] - primary_tokens[i]).abs().max().item()
-                if err > bypass_threshold:
-                    self._bypass_map[tile_token_start + i] = _quantize_int8(tile_tokens[i])
-
-        # ── Two-stage residual ──
         bases_res, alphas_res = None, None
         bases_shape_M_res = None
-        if cfg.use_differential and cfg.diff_strategy == "residual":
+
+        if adaptive_residual and not self.protected:
+            # Encode reconstruction error as 1-bit residual (δ-Δ correction)
+            threshold = getattr(cfg, 'adaptive_residual_threshold', 0.2)
+            residual_n_steps = getattr(cfg, 'adaptive_residual_n_steps', 1)
+            delta = tile - primary
+            cg = self.cross_token_group if self.cross_token_group >= 1 else 1
+            if cg > 1:
+                d_head_orig = delta.shape[1] // cg
+                delta_tokens = delta.reshape(-1, d_head_orig)
+            else:
+                delta_tokens = delta
+            n_real = min(delta_tokens.shape[0], n_real_tokens if n_real_tokens else delta_tokens.shape[0])
+            tile_linf = delta_tokens[:n_real].abs().max().item()
+
+            if tile_linf > threshold:
+                bases_res, alphas_res, _res_shape, _ = encode_matrix(
+                    delta, n_steps=residual_n_steps, tile_size=cfg.tile_size,
+                    beta=cfg.beta, proj_matrix=None, proj_beta=0.0, adaptive_eta=False,
+                )
+                bases_shape_M_res = bases_res.shape[-1]
+                bases_res = pack_bases(bases_res)
+                alphas_res = alphas_res.to(torch.float16)
+                self.diff_gamma = 1.0   # direct addition (residual correction)
+
+        elif use_legacy_residual:
             # Compute residual in transform domain to match primary tile layout.
             transform_mode = getattr(cfg, 'transform_mode', 'none')
             if transform_mode and transform_mode not in ("none", "", None, "fwht"):
@@ -642,6 +655,23 @@ class DSKVCacheStore:
             bases_shape_M_res = bases_res.shape[-1]
             bases_res = pack_bases(bases_res)
             alphas_res = alphas_res.to(torch.float16)
+
+        # ── Adaptive bypass (Phase 1 — deprecated, kept for backward compat) ──
+        if bypass_adaptive and not self.protected and not adaptive_residual:
+            bypass_threshold = getattr(cfg, 'bypass_threshold', 0.5)
+            cg = self.cross_token_group if self.cross_token_group >= 1 else 1
+            if cg > 1:
+                d_head_orig = tile.shape[1] // cg
+                tile_tokens = tile.reshape(-1, d_head_orig)
+                primary_tokens = primary.reshape(-1, d_head_orig)
+            else:
+                tile_tokens = tile
+                primary_tokens = primary
+            n_tokens_in_tile = min(tile_tokens.shape[0], n_real_tokens if n_real_tokens else tile_tokens.shape[0])
+            for i in range(n_tokens_in_tile):
+                err = (tile_tokens[i] - primary_tokens[i]).abs().max().item()
+                if err > bypass_threshold:
+                    self._bypass_map[tile_token_start + i] = _quantize_int8(tile_tokens[i])
 
         alphas = alphas.to(torch.float16)
 
@@ -686,7 +716,7 @@ class DSKVCacheStore:
                 )
 
         # ── Set diff_gamma for incremental path (was missing → residual never applied) ──
-        if cfg.use_differential and bases_res is not None:
+        if not adaptive_residual and cfg.use_differential and bases_res is not None:
             self.diff_gamma = cfg.get_diff_residual_gamma_k() if not is_v else cfg.diff_residual_gamma
 
         # ── Persist transform mode from config (first tile only) ──
@@ -739,6 +769,21 @@ class DSKVCacheStore:
                     self.bases_residual = bases_res
                     self.bases_shape_M_residual = bases_shape_M_res
                     self.alphas_residual = alphas_res
+            elif self.bases_residual is not None:
+                # Adaptive residual: pad neutral tile to keep residual dim-1 aligned with primary
+                n_steps_r = self.bases_residual.shape[0]
+                dummy_res = torch.full(
+                    (n_steps_r, 1, self.bases_residual.shape[2]),
+                    -1, device=self.bases_residual.device,
+                    dtype=self.bases_residual.dtype,
+                )
+                self.bases_residual = torch.cat([self.bases_residual, dummy_res], dim=1)
+                dummy_alpha = torch.zeros(
+                    n_steps_r, 1,
+                    device=self.alphas_residual.device,
+                    dtype=self.alphas_residual.dtype,
+                )
+                self.alphas_residual = torch.cat([self.alphas_residual, dummy_alpha], dim=1)
             # ── Roadmap 3 & 1: append per-tile decisions ──
             if tile_xform_decisions is not None:
                 if self.transform_decisions is None:

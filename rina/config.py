@@ -264,16 +264,57 @@ class DSKVCacheConfig:
     This ensures the decode phase starts from zero quantization error.
     Default False."""
 
-    # ── Adaptive bypass (Phase 1 Quality) ──
+    # ── Adaptive bypass (Phase 1 Quality — DEPRECATED, use adaptive_residual) ──
     bypass_adaptive: bool = False
-    """If True, bypass decision is based on per-tile L∞ reconstruction error
-    rather than a fixed interval."""
+    """DEPRECATED.  If True, bypass decision is based on per-tile L∞ reconstruction error."""
     bypass_threshold: float = 0.5
-    """L∞ norm threshold for adaptive bypass. When the max absolute
-    reconstruction error in a tile exceeds this value, the corresponding
-    token is recorded in _bypass_map at FP16 precision.
-    Lower = more bypasses (better quality, lower CR).
-    Recommended range: 0.3 (aggressive) – 1.0 (lenient)."""
+    """DEPRECATED.  L∞ norm threshold for adaptive bypass."""
+
+    # ── Key Position Protection (Attention Phase 1) ──
+    decode_protect_steps: int = 3
+    """Number of initial decode steps to store at FP16 precision via bypass_map_fp16.
+    Protects attention initialization from 1-bit quantization error.
+    Default 3.  Higher → more stable but slightly less CR."""
+
+    decode_protect_layers: str = "last_4"
+    """Which layers to protect in key-position protection.
+    Options:
+      \"all\"        — all layers (Stage 1 behavior)
+      \"last_4\"     — last 4 layers (recommended for Stage 2)
+      \"first_last\" — first and last layer only
+      \"none\"       — disable per-layer protection
+    """
+
+    # ── Confidence-Masked Attention (Phase 3) ──
+    confidence_mask: bool = False
+    """If True, apply per-token confidence penalty to attention scores."""
+
+    confidence_beta: float = 0.3
+    """Penalty scaling factor.  0.3 = moderate, 0.7 = aggressive."""
+
+    # ── Temporal Attention Smoothing (Phase 4) ──
+    attn_smoothing_alpha: float = 1.0
+    """Temporal attention smoothing factor.  1.0 = no smoothing (use current only),
+    0.9 = 90% current + 10% previous step's attention distribution.
+    Lower → smoother but may lag behind.  Recommended 0.85-0.95 when enabled."""
+
+    # ── Adaptive 1-bit Residual Correction ──
+    adaptive_residual: bool = False
+    """If True, encode per-tile reconstruction error (delta = tile - primary_recon)
+    using 1-bit Σ-Δ encoding and store as bases_residual / alphas_residual.
+    This keeps the entire pipeline at 1-bit density — each correction tile adds
+    only 4 packed-bits + 1 FP16 alpha ≈ 0.25 bits/element."""
+
+    adaptive_residual_threshold: float = 0.2
+    """L∞ threshold for adaptive residual.  When any token's reconstruction
+    error in a tile exceeds this, the full tile's delta is 1-bit encoded.
+    Lower = more residuals (better quality, higher CR cost).
+    Recommended range: 0.1 – 0.5."""
+
+    adaptive_residual_n_steps: int = 1
+    """Number of Σ-Δ steps for adaptive residual encoding.
+    1 step = 4 packed-bits ≈ 0.25 bits/element.  Higher = more precise but
+    less memory-efficient."""
 
     # ── Pyramid prefill (Phase 3) ──
     prefill_system_protect_len: int = 128
@@ -409,6 +450,17 @@ class DSKVCacheConfig:
             if idx == layer_idx:
                 return True
         return False
+
+    def get_decode_protect_layers(self, num_layers: int) -> set:
+        """Resolve decode_protect_layers string config to a set of layer indices."""
+        if self.decode_protect_layers == "all":
+            return set(range(num_layers))
+        elif self.decode_protect_layers == "last_4":
+            return set(range(max(0, num_layers - 4), num_layers))
+        elif self.decode_protect_layers == "first_last":
+            return {0, num_layers - 1}
+        else:
+            return set()
 
     def get_beta_for_decode_step(self, step_idx: int) -> float:
         """Get the Σ-Δ beta for a decode step, with optional decay.

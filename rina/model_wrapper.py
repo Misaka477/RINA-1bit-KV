@@ -102,6 +102,15 @@ class DSKVCacheModel:
             model.config.hidden_size // model.config.num_attention_heads
         )
 
+        # Stage 3: Confidence-masked attention state
+        self._confidence_vectors: List[Optional[torch.Tensor]] = []
+        self._apply_confidence: bool = False
+        self._attn_hook_handles: List = []
+
+        # Stage 4: Temporal attention smoothing state
+        self._prev_attentions: List[Optional[torch.Tensor]] = []
+        self._apply_smoothing: bool = False
+
         _logger.info(
             "DSKVCacheModel: %d layers, %d KV heads, d_head=%d, K=%d-steps, V=%d-steps",
             self._num_layers, self._num_kv_heads, self._d_head,
@@ -283,10 +292,27 @@ class DSKVCacheModel:
             is_bypass = (self.cfg.refresh_interval > 0 and
                          (decode_step == 0 or (decode_step + 1) % self.cfg.refresh_interval == 0))
 
+            # ── Key Position Protection (Phase 1): FP16 bypass for initial decode steps ──
+            protect_positions = (
+                self.cfg.decode_protect_steps > 0
+                and decode_step < self.cfg.decode_protect_steps
+            )
+            if protect_positions:
+                _protect_layers = self.cfg.get_decode_protect_layers(self._num_layers)
+            else:
+                _protect_layers = set()
+
             for h in range(n_kv):
                 # Slice out the LAST token only (use new_token_idx: without stop)
                 k_new = k_full[0, h, new_token_idx:]  # (1, d_head)
                 v_new = v_full[0, h, new_token_idx:]  # (1, d_head)
+
+                # ── Key Position Protection: write FP16 bypass before append_incremental ──
+                if layer_idx in _protect_layers:
+                    k_pos = k_stores[h].n_tokens
+                    v_pos = v_stores[h].n_tokens
+                    k_stores[h]._bypass_map_fp16[k_pos] = k_new.half().squeeze(0)
+                    v_stores[h]._bypass_map_fp16[v_pos] = v_new.half().squeeze(0)
 
                 v_rot = v_stores[h].v_rotation_matrix
                 k_momentum, k_integrator2 = k_stores[h].append_incremental(
@@ -363,7 +389,81 @@ class DSKVCacheModel:
             new_past.key_cache.append(k_recon_stack.unsqueeze(0))
             new_past.value_cache.append(v_recon_stack.unsqueeze(0))
 
+        # Build confidence vectors for next decode step (Stage 3)
+        if self.cfg.confidence_mask:
+            self._confidence_vectors = []
+            for layer_idx in range(self._num_layers):
+                conf = self._build_confidence_vector(layer_idx)
+                self._confidence_vectors.append(conf)
+
         return new_past
+
+    def _build_confidence_vector(self, layer_idx: int) -> torch.Tensor:
+        """Return (total_tokens,) float32 tensor with per-position confidence.
+
+        Confidence sources:
+          FP16 bypass positions  → 1.0
+          Raw buffer positions   → 1.0
+          Residual-corrected tiles → 0.85 (baseline 0.65 + 0.20)
+          Pure Σ-Δ (no correction) → 0.65
+        """
+        k_stores = self._ds_layers[layer_idx][0]
+        n_kv = len(k_stores)
+        store = k_stores[0]
+        total = store.n_tokens
+
+        # Prepend prefill confidence when dual store is active
+        has_prefill = hasattr(self, '_ds_prefill_layers') and self._ds_prefill_layers
+        if has_prefill and layer_idx < len(self._ds_prefill_layers):
+            pk_stores = self._ds_prefill_layers[layer_idx][0]
+            if n_kv > 0 and pk_stores[0] is not None:
+                prefill_store = pk_stores[0]
+                prefill_total = prefill_store.n_tokens
+                total = prefill_total + store.n_tokens
+            else:
+                prefill_store = None
+                prefill_total = 0
+        else:
+            prefill_store = None
+            prefill_total = 0
+
+        conf = torch.full((total,), 0.65)  # baseline: pure Σ-Δ
+
+        def _fill_conf(_store, _offset):
+            """Fill confidence vector for a store starting at _offset."""
+            _total = _store.n_tokens
+
+            # FP16 bypass positions → full confidence
+            if _store._bypass_map_fp16:
+                for pos in _store._bypass_map_fp16:
+                    abs_pos = _offset + pos
+                    if abs_pos < conf.shape[0]:
+                        conf[abs_pos] = 1.0
+
+            # Raw buffer positions → full confidence
+            if _store.raw_buffer is not None and _store.buffer_full > 0:
+                start = _offset + _total - _store.buffer_full
+                if start < conf.shape[0]:
+                    conf[start:] = 1.0
+
+            # Residual-corrected tiles → better than pure Σ-Δ
+            if _store.bases_residual is not None and _store.alphas_residual is not None:
+                n_tiles_res = _store.bases_residual.shape[1]
+                ts = _store.tile_size
+                for tile_idx in range(n_tiles_res):
+                    pos_start = _offset + tile_idx * ts
+                    pos_end = min(pos_start + ts, conf.shape[0])
+                    if pos_start >= conf.shape[0]:
+                        break
+                    conf[pos_start:pos_end] = torch.clamp(
+                        conf[pos_start:pos_end] + 0.20, max=1.0,
+                    )
+
+        if prefill_store is not None:
+            _fill_conf(prefill_store, 0)
+        _fill_conf(store, prefill_total)
+
+        return conf
 
     # ------------------------------------------------------------------
     # Generation
@@ -424,54 +524,147 @@ class DSKVCacheModel:
         first_token = output.logits[0, -1, :].argmax().item()
         generated_ids.append(first_token)
 
-        # ── Decode Loop ──
-        for step in range(1, max_new_tokens):
-            last_token = torch.tensor([[generated_ids[-1]]], device=device)
+        # Register Stage 3-4 attention hooks
+        self._register_stage_hooks()
 
-            with torch.no_grad():
-                output = self.model(
-                    input_ids=last_token,
-                    use_cache=True,
-                    output_hidden_states=False,
-                    past_key_values=past,
-                )
+        try:
+            # ── Decode Loop ──
+            for step in range(1, max_new_tokens):
+                last_token = torch.tensor([[generated_ids[-1]]], device=device)
 
-            # output.past_key_values = [DS_decoded_0..T-1, raw_KV_T]
-            # Incrementally encode only the NEW token (position -1)
-            # step=1 → decode_step=0 (the first auto-regressive token after prefill)
-            self._append_incremental(output.past_key_values, new_token_idx=-1, decode_step=step - 1)
-            past = self._build_past_from_ds()
-
-            # ── Sample next token ──
-            logits = output.logits[0, -1, :]
-            if temperature > 0 and do_sample:
-                logits = logits / temperature
-                if top_p < 1.0:
-                    sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-                    cumulative_probs = torch.cumsum(
-                        torch.softmax(sorted_logits, dim=-1), dim=-1
+                with torch.no_grad():
+                    output = self.model(
+                        input_ids=last_token,
+                        use_cache=True,
+                        output_hidden_states=False,
+                        output_attentions=self._apply_smoothing,
+                        past_key_values=past,
                     )
-                    remove_mask = cumulative_probs > top_p
-                    remove_mask[1:] = remove_mask[:-1].clone()
-                    remove_mask[0] = False
-                    indices_to_remove = sorted_indices[remove_mask]
-                    logits[indices_to_remove] = float('-inf')
-                probs = torch.softmax(logits, dim=-1)
-                next_token_id = torch.multinomial(probs, num_samples=1).item()
-            else:
-                next_token_id = torch.argmax(logits).item()
 
-            generated_ids.append(next_token_id)
+                # output.past_key_values = [DS_decoded_0..T-1, raw_KV_T]
+                # Incrementally encode only the NEW token (position -1)
+                # step=1 → decode_step=0 (the first auto-regressive token after prefill)
+                self._append_incremental(output.past_key_values, new_token_idx=-1, decode_step=step - 1)
+                past = self._build_past_from_ds()
 
-            if next_token_id == self.tokenizer.eos_token_id:
-                break
+                # ── Sample next token ──
+                logits = output.logits[0, -1, :]
+                if temperature > 0 and do_sample:
+                    logits = logits / temperature
+                    if top_p < 1.0:
+                        sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                        cumulative_probs = torch.cumsum(
+                            torch.softmax(sorted_logits, dim=-1), dim=-1
+                        )
+                        remove_mask = cumulative_probs > top_p
+                        remove_mask[1:] = remove_mask[:-1].clone()
+                        remove_mask[0] = False
+                        indices_to_remove = sorted_indices[remove_mask]
+                        logits[indices_to_remove] = float('-inf')
+                    probs = torch.softmax(logits, dim=-1)
+                    next_token_id = torch.multinomial(probs, num_samples=1).item()
+                else:
+                    next_token_id = torch.argmax(logits).item()
 
-            if step % 10 == 0:
-                _logger.info("  Step %d: %d tokens total", step, len(generated_ids))
+                generated_ids.append(next_token_id)
+
+                if next_token_id == self.tokenizer.eos_token_id:
+                    break
+
+                if step % 10 == 0:
+                    _logger.info("  Step %d: %d tokens total", step, len(generated_ids))
+
+        finally:
+            self._unregister_stage_hooks()
 
         result = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
         _logger.info("Generated %d tokens", len(generated_ids))
         return result
+
+    def _register_stage_hooks(self):
+        """Register attention hooks for Stage 3 (confidence mask) and Stage 4 (smoothing)."""
+        self._attn_hook_handles = []
+
+        if self.cfg.confidence_mask:
+            self._apply_confidence = True
+            for layer_idx in range(self._num_layers):
+                layer = self.model.model.layers[layer_idx]
+                pre_hook = self._make_confidence_pre_hook(layer_idx)
+                handle = layer.self_attn.register_forward_pre_hook(pre_hook, with_kwargs=True)
+                self._attn_hook_handles.append(handle)
+
+        if self.cfg.attn_smoothing_alpha < 1.0:
+            self._apply_smoothing = True
+            self._prev_attentions = [None] * self._num_layers
+            for layer_idx in range(self._num_layers):
+                layer = self.model.model.layers[layer_idx]
+                fwd_hook = self._make_smoothing_forward_hook(layer_idx)
+                handle = layer.self_attn.register_forward_hook(fwd_hook)
+                self._attn_hook_handles.append(handle)
+
+    def _unregister_stage_hooks(self):
+        """Remove all registered attention hooks."""
+        for handle in self._attn_hook_handles:
+            handle.remove()
+        self._attn_hook_handles = []
+
+    def _make_confidence_pre_hook(self, layer_idx: int):
+        """Create a pre-forward hook that penalizes low-confidence KV positions."""
+        def hook(module, args, kwargs):
+            if not self._apply_confidence:
+                return
+            if layer_idx >= len(self._confidence_vectors):
+                return
+            conf = self._confidence_vectors[layer_idx]
+            if conf is None:
+                return
+
+            mask = kwargs.get('attention_mask', None)
+            if mask is None or mask.numel() == 0:
+                return
+
+            # mask shape: (batch_size, 1, q_len, kv_len)
+            kv_len = mask.shape[-1]
+            conf_len = conf.shape[0]
+            penalty_len = min(kv_len, conf_len)
+
+            conf_slice = conf[:penalty_len].to(device=mask.device, dtype=mask.dtype)
+            penalty = self.cfg.confidence_beta * (1.0 - conf_slice)
+
+            penalized = mask.clone()
+            # Only penalize valid (non-masked) positions in the last query row
+            valid_positions = penalized[0, 0, -1, :penalty_len] > -1e4
+            penalized[0, 0, -1, :penalty_len] = torch.where(
+                valid_positions,
+                penalized[0, 0, -1, :penalty_len] - penalty,
+                penalized[0, 0, -1, :penalty_len],
+            )
+
+            kwargs['attention_mask'] = penalized
+        return hook
+
+    def _make_smoothing_forward_hook(self, layer_idx: int):
+        """Create a forward hook that smooths attention with previous step."""
+        def hook(module, args, output):
+            if not self._apply_smoothing:
+                return output
+            # output is tuple: (attn_output, attn_weights, past_key_value)
+            if not isinstance(output, tuple) or len(output) < 2:
+                return output
+            attn_weights = output[1]
+            if attn_weights is None:
+                return output
+
+            prev = self._prev_attentions[layer_idx]
+            if prev is not None and prev.shape == attn_weights.shape:
+                alpha = self.cfg.attn_smoothing_alpha
+                smoothed = alpha * attn_weights + (1.0 - alpha) * prev
+                self._prev_attentions[layer_idx] = attn_weights.detach()
+                return (output[0], smoothed) + output[2:]
+            else:
+                self._prev_attentions[layer_idx] = attn_weights.detach()
+                return output
+        return hook
 
     # ------------------------------------------------------------------
     # Diagnostics

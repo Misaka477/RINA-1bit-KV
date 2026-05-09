@@ -84,7 +84,13 @@ def make_config(route: MaskRoute, quality: str = "balanced", cross_token_group: 
                  refresh_interval: int = 0, prefill_protected: bool = False,
                  bypass_adaptive: bool = False, bypass_threshold: float = 0.5,
                  prefill_system_protect_len: int = 0, prefill_tail_protect_len: int = 0,
-                 prefill_n_steps: Optional[int] = None) -> Optional[DSKVCacheConfig]:
+                 prefill_n_steps: Optional[int] = None,
+                 adaptive_residual: bool = False, adaptive_residual_threshold: float = 0.2,
+                 adaptive_residual_n_steps: int = 1,
+                 decode_protect_steps: int = 3,
+                 decode_protect_layers: str = "all",
+                 confidence_mask: bool = False, confidence_beta: float = 0.3,
+                 attn_smoothing_alpha: float = 1.0) -> Optional[DSKVCacheConfig]:
     """Build DSKVCacheConfig from route + quality preset.
 
     quality="balanced": current production settings (n_steps=5, ctg=2)
@@ -93,11 +99,14 @@ def make_config(route: MaskRoute, quality: str = "balanced", cross_token_group: 
     n_steps_override / n_steps_v_override: override n_steps in the config
     (useful for ablation sweeps).  n_steps_v_override defaults to n_steps_override.
     refresh_interval: periodic FP16 bypass interval (0=disabled).
-    bypass_adaptive: if True, use L∞-based per-token bypass (Phase 1).
+    bypass_adaptive: if True, use L∞-based per-token bypass (Phase 1, deprecated).
     bypass_threshold: L∞ threshold for adaptive bypass (default 0.5).
     prefill_system_protect_len: pyramid prefill system prompt length (Phase 3).
     prefill_tail_protect_len: pyramid prefill tail length (Phase 3).
     prefill_n_steps: dual store prefill n_steps (Phase 4). None=disabled.
+    adaptive_residual: if True, use 1-bit residual correction (replaces bypass).
+    adaptive_residual_threshold: L∞ threshold for adaptive residual (default 0.2).
+    adaptive_residual_n_steps: Σ-Δ steps for residual encoding (default 1).
     """
     if route.name == "native":
         return None
@@ -140,6 +149,14 @@ def make_config(route: MaskRoute, quality: str = "balanced", cross_token_group: 
             prefill_system_protect_len=prefill_system_protect_len,
             prefill_tail_protect_len=prefill_tail_protect_len,
             prefill_n_steps=prefill_n_steps,
+            adaptive_residual=adaptive_residual,
+            adaptive_residual_threshold=adaptive_residual_threshold,
+            adaptive_residual_n_steps=adaptive_residual_n_steps,
+            decode_protect_steps=decode_protect_steps,
+            decode_protect_layers=decode_protect_layers,
+            confidence_mask=confidence_mask,
+            confidence_beta=confidence_beta,
+            attn_smoothing_alpha=attn_smoothing_alpha,
             base_dtype="fp16",
             verbose=False,
         )
@@ -178,6 +195,14 @@ def make_config(route: MaskRoute, quality: str = "balanced", cross_token_group: 
             prefill_system_protect_len=prefill_system_protect_len,
             prefill_tail_protect_len=prefill_tail_protect_len,
             prefill_n_steps=prefill_n_steps,
+            adaptive_residual=adaptive_residual,
+            adaptive_residual_threshold=adaptive_residual_threshold,
+            adaptive_residual_n_steps=adaptive_residual_n_steps,
+            decode_protect_steps=decode_protect_steps,
+            decode_protect_layers=decode_protect_layers,
+            confidence_mask=confidence_mask,
+            confidence_beta=confidence_beta,
+            attn_smoothing_alpha=attn_smoothing_alpha,
             base_dtype="fp16",
             verbose=False,
         )
@@ -573,12 +598,32 @@ def main():
                    help="Enable adaptive bypass: L∞-based per-token bypass (Phase 1).")
     p.add_argument("--bypass-threshold", type=float, default=0.5,
                    help="L∞ threshold for adaptive bypass (default 0.5). Lower = more bypasses.")
+    p.add_argument("--adaptive-residual", action="store_true",
+                   help="Enable adaptive 1-bit residual correction. Encodes tile reconstruction error "
+                        "at ~0.25 bits/element, only for tiles exceeding L∞ threshold.")
+    p.add_argument("--adaptive-residual-threshold", type=float, default=0.2,
+                   help="L∞ threshold for adaptive residual (default 0.2). Lower = more corrections.")
+    p.add_argument("--adaptive-residual-n-steps", type=int, default=1,
+                   help="Σ-Δ steps for adaptive residual (default 1). 1=4 packed-bits per tile.")
     p.add_argument("--prefill-system-protect", type=int, default=0,
                    help="Pyramid prefill: number of initial prompt tokens stored at full precision (default 0=disabled).")
     p.add_argument("--prefill-tail-protect", type=int, default=0,
                    help="Pyramid prefill: number of final prompt tokens stored at full precision (default 0=disabled).")
     p.add_argument("--prefill-n-steps", type=int, default=None,
                    help="Dual store: prefill n_steps (e.g., 8). Decode uses global n_steps. None=disabled.")
+    p.add_argument("--decode-protect-steps", type=int, default=3,
+                   help="Number of initial decode steps stored at FP16 precision (Key Position Protection). "
+                        "Default 3. Higher → more stable but slightly less CR.")
+    p.add_argument("--decode-protect-layers", type=str, default="last_4",
+                   help="Which layers to protect: 'all', 'last_4', 'first_last', 'none'. Default: last_4.")
+    p.add_argument("--confidence-mask", action="store_true",
+                   help="Enable confidence-masked attention (Stage 3). "
+                        "Applies per-position penalty to attention scores based on KV encoding quality.")
+    p.add_argument("--confidence-beta", type=float, default=0.3,
+                   help="Confidence mask penalty scaling factor. 0.3 = moderate, 0.7 = aggressive. Default: 0.3.")
+    p.add_argument("--attn-smoothing-alpha", type=float, default=1.0,
+                   help="Temporal attention smoothing factor (Stage 4). 1.0 = off. "
+                        "0.9 = 90%% current + 10%% previous attention distribution. Default: 1.0.")
     p.add_argument("--json-output", type=str, default="eval_gen_fidelity_results.json",
                    help="JSON output file")
     p.add_argument("--csv-output", type=str, default=None,
@@ -685,7 +730,15 @@ def main():
                           bypass_threshold=args.bypass_threshold,
                           prefill_system_protect_len=args.prefill_system_protect,
                           prefill_tail_protect_len=args.prefill_tail_protect,
-                          prefill_n_steps=args.prefill_n_steps)
+                          prefill_n_steps=args.prefill_n_steps,
+                          adaptive_residual=args.adaptive_residual,
+                          adaptive_residual_threshold=args.adaptive_residual_threshold,
+                          adaptive_residual_n_steps=args.adaptive_residual_n_steps,
+                          decode_protect_steps=args.decode_protect_steps,
+                          decode_protect_layers=args.decode_protect_layers,
+                          confidence_mask=args.confidence_mask,
+                          confidence_beta=args.confidence_beta,
+                          attn_smoothing_alpha=args.attn_smoothing_alpha)
         label = route.label
 
         _logger.info(f"[{ri+1}/{len(ds_routes)}] {label}: "
@@ -693,8 +746,13 @@ def main():
                      f"use_mask_gating={route.use_mask_gating}")
 
         t0 = time.time()
+        wrapper = None
         try:
             wrapper = DSKVCacheModel(shared_model, tokenizer, cfg=cfg)
+
+            # Register Stage 3-4 attention hooks (confidence mask + smoothing)
+            if cfg.confidence_mask or cfg.attn_smoothing_alpha < 1.0:
+                wrapper._register_stage_hooks()
 
             for pi, prompt in enumerate(prompts):
                 _logger.info(f"    Prompt: \"{prompt[:40]}...\"")
@@ -764,8 +822,6 @@ def main():
                 if text_dir:
                     save_text_outputs(text_dir, label, pi, gen_text, native_text)
 
-            del wrapper
-
         except Exception as e:
             _logger.error(f"Route {label} FAILED: {e}", exc_info=True)
             for pi, prompt in enumerate(prompts):
@@ -779,6 +835,13 @@ def main():
                     "generated_text": f"[ROUTE ERROR: {e}]",
                     "native_text": "",
                 })
+        finally:
+            if wrapper is not None:
+                try:
+                    wrapper._unregister_stage_hooks()
+                except Exception:
+                    pass
+                del wrapper
 
     # Native entries
     for pi, prompt in enumerate(prompts):
@@ -855,7 +918,15 @@ def main():
                               bypass_threshold=args.bypass_threshold,
                               prefill_system_protect_len=args.prefill_system_protect,
                               prefill_tail_protect_len=args.prefill_tail_protect,
-                              prefill_n_steps=args.prefill_n_steps)
+                              prefill_n_steps=args.prefill_n_steps,
+                              adaptive_residual=args.adaptive_residual,
+                              adaptive_residual_threshold=args.adaptive_residual_threshold,
+                              adaptive_residual_n_steps=args.adaptive_residual_n_steps,
+                              decode_protect_steps=args.decode_protect_steps,
+                              decode_protect_layers=args.decode_protect_layers,
+                              confidence_mask=args.confidence_mask,
+                              confidence_beta=args.confidence_beta,
+                              attn_smoothing_alpha=args.attn_smoothing_alpha)
     report = {
         "config": {
             "model": args.model,
