@@ -1301,7 +1301,7 @@ def _encode_single_path(
         initial_momentum=initial_momentum,
         initial_integrator2=initial_integrator2,
         return_momentum=return_momentum,
-        use_fwht=cfg.use_fwht if transform_mode in ("none", "", None, "fwht") else False,
+        use_fwht=getattr(cfg, 'use_fwht', False) if transform_mode in ("none", "", None, "fwht") else False,
         zero_mean_integrator2=cfg.zero_mean_integrator2,
         use_mask_gating=getattr(cfg, 'use_mask_gating', True),
     )
@@ -1493,7 +1493,7 @@ def encode_kv_cache(
         # residual must be computed in the same domain to produce matching
         # tile counts during reconstruction.
         k_hat_primary = decode_from_bases(k_bases, k_alphas, k_shape, tile_size=cfg.tile_size,
-                                          use_fwht=cfg.use_fwht)
+                                          use_fwht=getattr(cfg, 'use_fwht', False))
         if transform_mode and transform_mode not in ("none", "", None, "fwht"):
             from rina.utils.transforms import apply_transform, apply_inverse_transform, TransformMode
             try:
@@ -1522,7 +1522,7 @@ def encode_kv_cache(
         )
 
         v_hat_primary = decode_from_bases(v_bases, v_alphas, v_shape, tile_size=cfg.tile_size,
-                                          use_fwht=cfg.use_fwht)
+                                          use_fwht=getattr(cfg, 'use_fwht', False))
         if transform_mode and transform_mode not in ("none", "", None, "fwht"):
             from rina.utils.transforms import apply_transform, TransformMode
             try:
@@ -1567,7 +1567,7 @@ def encode_kv_cache(
         diff_gamma=cfg.get_diff_residual_gamma_k() if cfg.use_differential else 0.0,
         cross_token_group=group_k,
         original_n_tokens=n_tokens_original,
-        use_fwht=cfg.use_fwht if transform_mode in ("none", "", None, "fwht") else False,
+        use_fwht=getattr(cfg, 'use_fwht', False) if transform_mode in ("none", "", None, "fwht") else False,
         transform_mode=transform_mode if transform_mode else "none",
         transform_decisions=k_xform_decisions if k_xform_decisions is not None else None,
         masking_decisions=k_mask_decisions if k_mask_decisions is not None else None,
@@ -1599,7 +1599,7 @@ def encode_kv_cache(
         v_rotation_matrix=v_rotation,
         cross_token_group=group_v,
         original_n_tokens=n_tokens_original,
-        use_fwht=cfg.use_fwht if transform_mode in ("none", "", None, "fwht") else False,
+        use_fwht=getattr(cfg, 'use_fwht', False) if transform_mode in ("none", "", None, "fwht") else False,
         transform_mode=transform_mode if transform_mode else "none",
         transform_decisions=v_xform_decisions if v_xform_decisions is not None else None,
         masking_decisions=v_mask_decisions if v_mask_decisions is not None else None,

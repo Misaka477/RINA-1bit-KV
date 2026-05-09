@@ -1367,7 +1367,7 @@ class ResidualBinaryPursuit(nn.Module):
 
     def forward(self, w: torch.Tensor) -> torch.Tensor:
         """Encode → decode round-trip (convenience, not for inference)."""
-        bases, alphas, shape = self.encode(w)
+        bases, alphas, shape, _ = self.encode(w)
         return self.decode(bases, alphas, shape)
 
     # ------------------------------------------------------------------

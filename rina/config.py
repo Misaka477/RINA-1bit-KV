@@ -35,9 +35,6 @@ class DSKVCacheConfig:
         Separate step count for Key path.  None → uses *n_steps*.
     n_steps_v : int | None
         Separate step count for Value path.  None → uses *n_steps*.
-    use_fwht : bool
-        Apply Fast Walsh-Hadamard Transform before encoding.
-        Deprecated in favour of *transform_mode*; kept for backward compat.
     beta : float
         Σ-Δ integrator feedback coefficient.  Higher → faster error correction
         but may overshoot.  Recommended 0.05 – 0.15.
@@ -122,20 +119,6 @@ class DSKVCacheConfig:
         a QR decomposition of the first-iteration FWHT coefficients.
         This decorrelates the V dimension and improves Σ-Δ encoding efficiency.
         Disabled automatically when *cross_token_group* > 1.
-    transform_mode : str
-        Transform mode for the encode path before Σ-Δ modulation.
-        "none" / "" / None → no transform (raw encoding)
-        "fwht" → Fast Walsh-Hadamard Transform (the original approach)
-        "dct" → Discrete Cosine Transform (energy compaction)
-        "dwt" → Discrete Wavelet Transform (multi-resolution)
-        "mixed" → Hybrid strategy that selects per-tile based on energy profile
-        See RINA_Whitepaper §9.2 for the transform roadmap.
-    transform_smooth_threshold : float
-        Energy ratio threshold below which a tile is considered "smooth"
-        and routed to DCT or DWT in mixed mode.
-    transform_outlier_threshold : float
-        Max-abs / std ratio above which a tile is considered to contain
-        outliers and routed to identity encoding in mixed mode.
     adaptive_masking : bool
         Enable adaptive bit-rate masking (Roadmap 1).
         Detects outlier tiles and boosts their encoding budget.
@@ -159,8 +142,6 @@ class DSKVCacheConfig:
     n_steps_k: Optional[int] = None
     n_steps_v: Optional[int] = None
 
-    use_fwht: bool = False
-    """Deprecated in favour of *transform_mode*."""
     beta: float = 0.10
     proj_beta: float = 0.5
     adaptive_eta: float = 0.0
@@ -213,12 +194,6 @@ class DSKVCacheConfig:
     v_orthogonal_transform: bool = True
     """Apply QR-based orthogonal rotation to V before encoding.
     Auto-disabled when cross_token_group > 1 (shape mismatch)."""
-
-    transform_mode: str = "none"
-    """'none', 'fwht', 'dct', 'dwt', or 'mixed'."""
-
-    transform_smooth_threshold: float = 0.05
-    transform_outlier_threshold: float = 3.0
 
     # ── Adaptive masking (Roadmap 1) ─────────────────────────────────────
     adaptive_masking: bool = False
