@@ -264,6 +264,32 @@ class DSKVCacheConfig:
     This ensures the decode phase starts from zero quantization error.
     Default False."""
 
+    # ── Adaptive bypass (Phase 1 Quality) ──
+    bypass_adaptive: bool = False
+    """If True, bypass decision is based on per-tile L∞ reconstruction error
+    rather than a fixed interval."""
+    bypass_threshold: float = 0.5
+    """L∞ norm threshold for adaptive bypass. When the max absolute
+    reconstruction error in a tile exceeds this value, the corresponding
+    token is recorded in _bypass_map at FP16 precision.
+    Lower = more bypasses (better quality, lower CR).
+    Recommended range: 0.3 (aggressive) – 1.0 (lenient)."""
+
+    # ── Pyramid prefill (Phase 3) ──
+    prefill_system_protect_len: int = 128
+    """Number of initial prefill tokens stored at full precision via bypass_map.
+    Typical system prompt length. Default 128."""
+    prefill_tail_protect_len: int = 32
+    """Number of final prefill tokens stored at full precision via bypass_map.
+    Last tokens are most critical for first-decode-step attention.
+    Default 32."""
+
+    # ── Dual store (Phase 4) ──
+    prefill_n_steps: Optional[int] = None
+    """If set, prefill uses this many bases per tile (e.g., 8 for high quality).
+    Decode still uses the global n_steps (e.g., 3).
+    None → no dual store, uses global n_steps for all tokens."""
+
     # ── Beta decay for decode (§8.1.11) ─────────────────────────────────
     beta_decay_start: Optional[float] = None
     """Initial beta for decode steps.  If None, uses self.beta."""

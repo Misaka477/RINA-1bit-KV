@@ -81,7 +81,10 @@ def build_routes() -> List[MaskRoute]:
 
 def make_config(route: MaskRoute, quality: str = "balanced", cross_token_group: int = 2,
                  n_steps_override: Optional[int] = None, n_steps_v_override: Optional[int] = None,
-                 refresh_interval: int = 0, prefill_protected: bool = False) -> Optional[DSKVCacheConfig]:
+                 refresh_interval: int = 0, prefill_protected: bool = False,
+                 bypass_adaptive: bool = False, bypass_threshold: float = 0.5,
+                 prefill_system_protect_len: int = 0, prefill_tail_protect_len: int = 0,
+                 prefill_n_steps: Optional[int] = None) -> Optional[DSKVCacheConfig]:
     """Build DSKVCacheConfig from route + quality preset.
 
     quality="balanced": current production settings (n_steps=5, ctg=2)
@@ -90,6 +93,11 @@ def make_config(route: MaskRoute, quality: str = "balanced", cross_token_group: 
     n_steps_override / n_steps_v_override: override n_steps in the config
     (useful for ablation sweeps).  n_steps_v_override defaults to n_steps_override.
     refresh_interval: periodic FP16 bypass interval (0=disabled).
+    bypass_adaptive: if True, use L∞-based per-token bypass (Phase 1).
+    bypass_threshold: L∞ threshold for adaptive bypass (default 0.5).
+    prefill_system_protect_len: pyramid prefill system prompt length (Phase 3).
+    prefill_tail_protect_len: pyramid prefill tail length (Phase 3).
+    prefill_n_steps: dual store prefill n_steps (Phase 4). None=disabled.
     """
     if route.name == "native":
         return None
@@ -127,6 +135,11 @@ def make_config(route: MaskRoute, quality: str = "balanced", cross_token_group: 
             dynamic_tile_size=False,
             refresh_interval=refresh_interval,
             prefill_protected=prefill_protected,
+            bypass_adaptive=bypass_adaptive,
+            bypass_threshold=bypass_threshold,
+            prefill_system_protect_len=prefill_system_protect_len,
+            prefill_tail_protect_len=prefill_tail_protect_len,
+            prefill_n_steps=prefill_n_steps,
             base_dtype="fp16",
             verbose=False,
         )
@@ -160,6 +173,11 @@ def make_config(route: MaskRoute, quality: str = "balanced", cross_token_group: 
             use_mask_gating=route.use_mask_gating,
             refresh_interval=refresh_interval,
             prefill_protected=prefill_protected,
+            bypass_adaptive=bypass_adaptive,
+            bypass_threshold=bypass_threshold,
+            prefill_system_protect_len=prefill_system_protect_len,
+            prefill_tail_protect_len=prefill_tail_protect_len,
+            prefill_n_steps=prefill_n_steps,
             base_dtype="fp16",
             verbose=False,
         )
@@ -325,6 +343,7 @@ def generate_with_kv_measurement(
     wrapper._bulk_encode_from_prefill(past_key_values, input_ids)
 
     # Compute KV fidelity per layer per head
+    has_prefill = hasattr(wrapper, '_ds_prefill_layers') and wrapper._ds_prefill_layers
     kv_results = []
     for layer_idx in range(wrapper._num_layers):
         k_stores = wrapper._ds_layers[layer_idx][0]
@@ -333,7 +352,26 @@ def generate_with_kv_measurement(
 
         for h in range(wrapper._num_kv_heads):
             orig_k, orig_v = orig_kv[layer_idx][h]
-            fidelity = compute_kv_fidelity(orig_k, orig_v, k_stores[h], v_stores[h], layer_cfg)
+            if has_prefill and layer_idx < len(wrapper._ds_prefill_layers):
+                pk_stores = wrapper._ds_prefill_layers[layer_idx][0]
+                if h < len(pk_stores) and pk_stores[h] is not None:
+                    pk = pk_stores[h]
+                    pv = wrapper._ds_prefill_layers[layer_idx][1][h]
+                    k_recon = pk.reconstruct_all(layer_cfg.tile_size, layer_cfg.use_differential)
+                    v_recon = pv.reconstruct_all(layer_cfg.tile_size, layer_cfg.use_differential)
+                    if k_stores[h].n_tokens > 0:
+                        k_recon = torch.cat([k_recon, k_stores[h].reconstruct_all(layer_cfg.tile_size, layer_cfg.use_differential)], dim=0)
+                        v_recon = torch.cat([v_recon, v_stores[h].reconstruct_all(layer_cfg.tile_size, layer_cfg.use_differential)], dim=0)
+                    k_mse = F.mse_loss(k_recon.float(), orig_k.float()).item()
+                    k_cos = F.cosine_similarity(k_recon.float().flatten().unsqueeze(0), orig_k.float().flatten().unsqueeze(0)).item()
+                    v_mse = F.mse_loss(v_recon.float(), orig_v.float()).item()
+                    v_cos = F.cosine_similarity(v_recon.float().flatten().unsqueeze(0), orig_v.float().flatten().unsqueeze(0)).item()
+                    comp_ratio = (orig_k.element_size() * orig_k.numel() + orig_v.element_size() * orig_v.numel()) / (pk.memory_bytes + pv.memory_bytes + k_stores[h].memory_bytes + v_stores[h].memory_bytes + 1e-12)
+                    fidelity = {"k_cos_sim": float(k_cos), "k_mse": float(k_mse), "k_snr_db": 0.0, "v_cos_sim": float(v_cos), "v_mse": float(v_mse), "v_snr_db": 0.0, "compression_ratio": float(comp_ratio)}
+                else:
+                    fidelity = compute_kv_fidelity(orig_k, orig_v, k_stores[h], v_stores[h], layer_cfg)
+            else:
+                fidelity = compute_kv_fidelity(orig_k, orig_v, k_stores[h], v_stores[h], layer_cfg)
             fidelity["layer"] = layer_idx
             fidelity["head"] = h
             kv_results.append(fidelity)
@@ -531,6 +569,16 @@ def main():
                    help="Periodic FP16 bypass interval (0=disabled). Every N-th decode token stores FP16 in bypass map.")
     p.add_argument("--prefill-protected", action="store_true",
                    help="Store all prefill K/V as FP16 (bypass Σ-Δ encoding), giving decode zero-error start.")
+    p.add_argument("--bypass-adaptive", action="store_true",
+                   help="Enable adaptive bypass: L∞-based per-token bypass (Phase 1).")
+    p.add_argument("--bypass-threshold", type=float, default=0.5,
+                   help="L∞ threshold for adaptive bypass (default 0.5). Lower = more bypasses.")
+    p.add_argument("--prefill-system-protect", type=int, default=0,
+                   help="Pyramid prefill: number of initial prompt tokens stored at full precision (default 0=disabled).")
+    p.add_argument("--prefill-tail-protect", type=int, default=0,
+                   help="Pyramid prefill: number of final prompt tokens stored at full precision (default 0=disabled).")
+    p.add_argument("--prefill-n-steps", type=int, default=None,
+                   help="Dual store: prefill n_steps (e.g., 8). Decode uses global n_steps. None=disabled.")
     p.add_argument("--json-output", type=str, default="eval_gen_fidelity_results.json",
                    help="JSON output file")
     p.add_argument("--csv-output", type=str, default=None,
@@ -632,7 +680,12 @@ def main():
         cfg = make_config(route, quality=args.quality, cross_token_group=ctg,
                           n_steps_override=args.n_steps, n_steps_v_override=args.n_steps_v,
                           refresh_interval=args.refresh_interval,
-                          prefill_protected=args.prefill_protected)
+                          prefill_protected=args.prefill_protected,
+                          bypass_adaptive=args.bypass_adaptive,
+                          bypass_threshold=args.bypass_threshold,
+                          prefill_system_protect_len=args.prefill_system_protect,
+                          prefill_tail_protect_len=args.prefill_tail_protect,
+                          prefill_n_steps=args.prefill_n_steps)
         label = route.label
 
         _logger.info(f"[{ri+1}/{len(ds_routes)}] {label}: "
@@ -797,7 +850,12 @@ def main():
     config_dict = make_config(build_routes()[1], quality=args.quality, cross_token_group=ctg,
                               n_steps_override=args.n_steps, n_steps_v_override=args.n_steps_v,
                               refresh_interval=args.refresh_interval,
-                              prefill_protected=args.prefill_protected)
+                              prefill_protected=args.prefill_protected,
+                              bypass_adaptive=args.bypass_adaptive,
+                              bypass_threshold=args.bypass_threshold,
+                              prefill_system_protect_len=args.prefill_system_protect,
+                              prefill_tail_protect_len=args.prefill_tail_protect,
+                              prefill_n_steps=args.prefill_n_steps)
     report = {
         "config": {
             "model": args.model,

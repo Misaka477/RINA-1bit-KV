@@ -123,12 +123,24 @@ class DSKVCacheModel:
         Short prefill sequences (< tile_size) naturally stay in raw_buffer
         with perfect fp16 fidelity via the store's incremental path — no
         padding degradation.
+
+        Phase 4: When prefill_n_steps is set and differs from the global n_steps,
+        creates a separate prefill store with higher n_steps and an empty decode
+        store.  _build_past_from_ds concatenates both reconstructions.
         """
-        from rina.ds_kv_cache import DSKVCacheStore, _build_v_rotation, encode_kv_cache
+        from rina.ds_kv_cache import (DSKVCacheStore, _build_v_rotation,
+                                      encode_kv_cache)
 
         self._ds_layers = []
+        self._ds_prefill_layers = []
         self._v_rotations = []
         n_kv = self._num_kv_heads
+
+        use_prefill_protect = getattr(self.cfg, 'prefill_protected', False)
+        sys_protect = getattr(self.cfg, 'prefill_system_protect_len', 0)
+        tail_protect = getattr(self.cfg, 'prefill_tail_protect_len', 0)
+        use_pyramid = (not use_prefill_protect) and (sys_protect > 0 or tail_protect > 0)
+        prefill_n = getattr(self.cfg, 'prefill_n_steps', None)
 
         for layer_idx in range(self._num_layers):
             k_full, v_full = _past_get_kv(past_key_values, layer_idx)
@@ -139,25 +151,83 @@ class DSKVCacheModel:
 
             # ── Protected layer (§8.1.8): skip 1-bit encoding ──────────
             is_protected = layer_idx in self.cfg.protected_layers
-            use_prefill_protect = getattr(self.cfg, 'prefill_protected', False)
+            use_dual = (prefill_n is not None
+                        and prefill_n != layer_cfg.get_n_steps_k()
+                        and not is_protected
+                        and not use_prefill_protect)
 
             layer_k_stores = []
             layer_v_stores = []
+            prefill_k_stores = []
+            prefill_v_stores = []
 
             for h in range(n_kv):
                 k_h = k_full[0, h].float()  # (T, d_head)
                 v_h = v_full[0, h].float()  # (T, d_head)
+                T = k_h.shape[0]
 
-                # Bulk encode: uses cross_token_group for joint encoding
-                k_store, v_store = encode_kv_cache(
-                    k_h, v_h, layer_cfg,
-                    protected=is_protected or use_prefill_protect,
-                )
+                if use_dual:
+                    # ── Dual store: prefill with high n_steps, decode starts empty ──
+                    prefill_cfg = copy.copy(layer_cfg)
+                    prefill_cfg.n_steps = prefill_n
+                    prefill_cfg.n_steps_k = prefill_n
+                    prefill_cfg.n_steps_v = prefill_n
+                    prefill_k, prefill_v = encode_kv_cache(
+                        k_h, v_h, prefill_cfg, protected=is_protected,
+                    )
+                    # Pyramid bypass on prefill store (FP16 precision)
+                    if use_pyramid:
+                        sys_len = min(sys_protect, T)
+                        for i in range(sys_len):
+                            prefill_k._bypass_map_fp16[i] = k_h[i].half()
+                            prefill_v._bypass_map_fp16[i] = v_h[i].half()
+                        tail_len = min(tail_protect, T)
+                        if tail_len > 0:
+                            for i in range(tail_len):
+                                pos = T - tail_len + i
+                                prefill_k._bypass_map_fp16[pos] = k_h[pos].half()
+                                prefill_v._bypass_map_fp16[pos] = v_h[pos].half()
+
+                    # Decode store starts empty (inherits V rotation from prefill)
+                    k_store = DSKVCacheStore(
+                        tile_size=layer_cfg.tile_size,
+                        cross_token_group=layer_cfg.cross_token_group,
+                    )
+                    v_store = DSKVCacheStore(
+                        tile_size=layer_cfg.tile_size,
+                        cross_token_group=layer_cfg.cross_token_group,
+                    )
+                    v_store.v_rotation_matrix = prefill_v.v_rotation_matrix
+                    prefill_k_stores.append(prefill_k)
+                    prefill_v_stores.append(prefill_v)
+                else:
+                    # ── Single store: encode + decode share same store ──
+                    k_store, v_store = encode_kv_cache(
+                        k_h, v_h, layer_cfg,
+                        protected=is_protected or use_prefill_protect,
+                    )
+
+                    # ── Pyramid prefill (Phase 3): overlay system prompt + tail (FP16) ──
+                    if use_pyramid and not is_protected:
+                        sys_len = min(sys_protect, T)
+                        for i in range(sys_len):
+                            k_store._bypass_map_fp16[i] = k_h[i].half()
+                            v_store._bypass_map_fp16[i] = v_h[i].half()
+                        tail_len = min(tail_protect, T)
+                        if tail_len > 0:
+                            for i in range(tail_len):
+                                pos = T - tail_len + i
+                                k_store._bypass_map_fp16[pos] = k_h[pos].half()
+                                v_store._bypass_map_fp16[pos] = v_h[pos].half()
+
+                    prefill_k_stores.append(None)
+                    prefill_v_stores.append(None)
 
                 layer_k_stores.append(k_store)
                 layer_v_stores.append(v_store)
 
             self._ds_layers.append((layer_k_stores, layer_v_stores))
+            self._ds_prefill_layers.append((prefill_k_stores, prefill_v_stores))
 
     # ------------------------------------------------------------------
     # Decode loop: append_incremental per new token
@@ -238,30 +308,60 @@ class DSKVCacheModel:
         """Reconstruct full past_key_values from DS stores.
 
         Returns DynamicCache with shape (1, n_kv_heads, total_tokens, d_head).
+
+        Phase 4: When _ds_prefill_layers exists, concatenates prefill store
+        reconstruction with decode store reconstruction per head.
         """
         if device is None:
             device = self.model.device
 
         new_past = DynamicCache()
+        has_prefill = hasattr(self, '_ds_prefill_layers') and self._ds_prefill_layers
 
         for layer_idx in range(self._num_layers):
             k_stores = self._ds_layers[layer_idx][0]
             v_stores = self._ds_layers[layer_idx][1]
+            n_kv = len(k_stores)
 
-            k_recon = torch.stack(
-                [s.reconstruct_all(self.cfg.tile_size, self.cfg.use_differential)
-                 for s in k_stores],
-                dim=0,
-            ).to(dtype=torch.float16, device=device)  # (n_kv_heads, T, d_head)
-            v_recon = torch.stack(
-                [s.reconstruct_all(self.cfg.tile_size, self.cfg.use_differential)
-                 for s in v_stores],
-                dim=0,
-            ).to(dtype=torch.float16, device=device)  # (n_kv_heads, T, d_head)
+            k_list, v_list = [], []
+            for h in range(n_kv):
+                k_recon = k_stores[h].reconstruct_all(
+                    self.cfg.tile_size, self.cfg.use_differential,
+                )
+                v_recon = v_stores[h].reconstruct_all(
+                    self.cfg.tile_size, self.cfg.use_differential,
+                )
+
+                if has_prefill and layer_idx < len(self._ds_prefill_layers):
+                    pk_stores = self._ds_prefill_layers[layer_idx][0]
+                    if h < len(pk_stores) and pk_stores[h] is not None:
+                        pv_stores = self._ds_prefill_layers[layer_idx][1]
+                        k_prefill = pk_stores[h].reconstruct_all(
+                            self.cfg.tile_size, self.cfg.use_differential,
+                        )
+                        v_prefill = pv_stores[h].reconstruct_all(
+                            self.cfg.tile_size, self.cfg.use_differential,
+                        )
+                        if k_recon.numel() == 0:
+                            k_recon = k_prefill
+                            v_recon = v_prefill
+                        else:
+                            k_recon = torch.cat([k_prefill, k_recon], dim=0)
+                            v_recon = torch.cat([v_prefill, v_recon], dim=0)
+
+                k_list.append(k_recon)
+                v_list.append(v_recon)
+
+            k_recon_stack = torch.stack(k_list, dim=0).to(
+                dtype=torch.float16, device=device,
+            )
+            v_recon_stack = torch.stack(v_list, dim=0).to(
+                dtype=torch.float16, device=device,
+            )
 
             # Add batch dim: (1, n_kv_heads, T, d_head)
-            new_past.key_cache.append(k_recon.unsqueeze(0))
-            new_past.value_cache.append(v_recon.unsqueeze(0))
+            new_past.key_cache.append(k_recon_stack.unsqueeze(0))
+            new_past.value_cache.append(v_recon_stack.unsqueeze(0))
 
         return new_past
 

@@ -32,6 +32,29 @@ from rina.utils.bit_packing import pack_bases, unpack_bases
 _logger = logging.getLogger(__name__)
 
 
+def _quantize_int8(t: torch.Tensor) -> Tuple[torch.Tensor, float]:
+    scale = t.abs().max().item() / 127.0
+    if scale == 0:
+        scale = 1.0
+    q = (t.float() / scale).round().clamp(-128, 127).to(torch.int8)
+    return q, scale
+
+
+def _quantize_int8_batch(tokens: torch.Tensor) -> List[Tuple[torch.Tensor, float]]:
+    """Quantize a batch of tokens (N, d_head) to INT8, returning one (q, scale)
+    tuple per token.  Avoids per-token CUDA→CPU sync by computing all
+    per-row absmax in a single reduction."""
+    absmax = tokens.abs().amax(dim=1, keepdim=True)  # (N, 1)
+    scales = absmax / 127.0
+    scales = torch.where(scales == 0, torch.ones_like(scales), scales)  # avoid div-by-zero
+    q_batch = (tokens.float() / scales).round().clamp(-128, 127).to(torch.int8)
+    return [(q_batch[i], float(scales[i].item())) for i in range(tokens.shape[0])]
+
+
+def _dequantize_int8(q: torch.Tensor, scale: float) -> torch.Tensor:
+    return q.float() * scale
+
+
 @dataclass
 class DSKVCacheStore:
     """On-device storage for a single head's DS-encoded K/V cache.
@@ -134,12 +157,17 @@ class DSKVCacheStore:
     svd_shaper: Optional[Dict] = None
 
     # ── Periodic FP16 bypass (P1 anchor token refresh) ──
-    _bypass_map: Dict[int, torch.Tensor] = field(default_factory=dict)
-    """Position → FP16 tensor.  When refresh_interval > 0, every Nth
-    decode token is recorded here at full precision.  reconstruct_all
-    overwrites the corresponding positions with these values, giving
-    higher-quality K/V at anchor points and resetting accumulated
+    _bypass_map: Dict[int, Tuple[torch.Tensor, float]] = field(default_factory=dict)
+    """Position → (int8_tensor, scale).  Each entry stores a quantized INT8
+    version of the original FP16 tensor with a per-token scale factor.
+    reconstruct_all dequantizes and overwrites the corresponding positions,
+    giving higher-quality K/V at anchor points and resetting accumulated
     quantization error."""
+
+    _bypass_map_fp16: Dict[int, torch.Tensor] = field(default_factory=dict)
+    """Position → FP16 tensor.  Used by pyramid prefill (Phase 3) for critical
+    system/tail tokens that require full precision.  reconstruct_all checks
+    this map after _bypass_map, so FP16 entries take priority."""
 
     # ── Incremental buffer (§5) ──
     raw_buffer: Optional[torch.Tensor] = None      # (B, d_head) FP16, B < tile_size
@@ -275,13 +303,16 @@ class DSKVCacheStore:
         is_v = v_rotation is not None  # V path flag: determines n_steps later
 
         # ── Periodic FP16 bypass (P1 anchor refresh): record current position ──
-        if bypass and not self.protected:
+        # Skip pre-encode bypass when adaptive bypass is active — the adaptive
+        # check runs after tile encoding in _encode_and_append_tile instead.
+        bypass_adaptive = getattr(cfg, 'bypass_adaptive', False)
+        if bypass and not self.protected and not bypass_adaptive:
             pos = self.n_tokens  # logical position before this append
             if v_rotation is not None:
-                bypass_vec = (new_vec.float() @ v_rotation.float()).half().squeeze(0)
+                bypass_vec = (new_vec.float() @ v_rotation.float()).squeeze(0)
             else:
-                bypass_vec = new_vec.half().squeeze(0)
-            self._bypass_map[pos] = bypass_vec
+                bypass_vec = new_vec.squeeze(0)
+            self._bypass_map[pos] = _quantize_int8(bypass_vec)
 
         # ── Protected mode: just accumulate raw FP16, never encode ──
         if self.protected:
@@ -346,6 +377,7 @@ class DSKVCacheStore:
             # ── Cross-token mode: group G * tile_size tokens per encoding unit ──
             group_trigger = tile_size * cross_token_group
             momentum, integrator2 = initial_momentum, initial_integrator2
+            token_offset = self.n_tokens - self.buffer_full
             while self.buffer_full >= group_trigger:
                 group_tokens = self.raw_buffer[:group_trigger].to(torch.float32)
                 # Reshape: (G*T, d_head) → (T, G*d_head)
@@ -354,8 +386,10 @@ class DSKVCacheStore:
                     group_reshaped, cfg=cfg, svd_shaper=svd_shaper, is_v=is_v,
                     initial_momentum=momentum, initial_integrator2=integrator2,
                     n_real_tokens=group_trigger,
+                    tile_token_start=token_offset,
                 )
                 momentum, integrator2 = ret_momentum, ret_integrator2
+                token_offset += group_trigger
                 self.raw_buffer = self.raw_buffer[group_trigger:]
                 self.buffer_full = self.raw_buffer.shape[0] if self.raw_buffer.numel() > 0 else 0
                 if self.buffer_full == 0:
@@ -369,6 +403,7 @@ class DSKVCacheStore:
             # tile dimension.  This avoids long raw-buffer residency for
             # the first 15 tokens while preserving Tensor Core alignment.
             momentum, integrator2 = initial_momentum, initial_integrator2
+            token_offset = self.n_tokens - self.buffer_full
 
             while True:
                 # ── Determine effective tile size for this iteration ──
@@ -397,8 +432,10 @@ class DSKVCacheStore:
                     tile, cfg=cfg, svd_shaper=svd_shaper, is_v=is_v,
                     initial_momentum=momentum, initial_integrator2=integrator2,
                     n_real_tokens=effective_tile_size,
+                    tile_token_start=token_offset,
                 )
                 momentum, integrator2 = ret_momentum, ret_integrator2
+                token_offset += effective_tile_size
 
                 # Track padding so reconstruct_all can strip it
                 if self.tile_pad_counts is None:
@@ -423,6 +460,7 @@ class DSKVCacheStore:
         initial_momentum: Optional[torch.Tensor] = None,
         initial_integrator2: Optional[torch.Tensor] = None,
         n_real_tokens: Optional[int] = None,
+        tile_token_start: int = 0,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor]]:
         """Encode a single (tile_size, d_head) tile and concatenate to store.
 
@@ -434,6 +472,8 @@ class DSKVCacheStore:
         initial_integrator2: Cross-head second-order integrator from previous head.
         n_real_tokens: Actual number of real tokens encoded in this tile.
             None defaults to tile_size * cross_token_group.
+        tile_token_start: Global token index of the first token in this tile
+            (used for adaptive bypass position tracking).
 
         Returns
         -------
@@ -539,11 +579,33 @@ class DSKVCacheStore:
         bases_M = bases.shape[-1]
         packed = pack_bases(bases)
 
+        # ── Primary reconstruction (used by differential AND adaptive bypass) ──
+        bypass_adaptive = getattr(cfg, 'bypass_adaptive', False)
+        need_primary = (cfg.use_differential and cfg.diff_strategy == "residual") or (bypass_adaptive and not self.protected)
+        if need_primary:
+            primary = decode_from_bases(bases, alphas, shape, tile_size=tile_size)
+
+        # ── Adaptive bypass (Phase 1): record FP16 for tokens with high L∞ error ──
+        if bypass_adaptive and not self.protected:
+            bypass_threshold = getattr(cfg, 'bypass_threshold', 0.5)
+            cg = self.cross_token_group if self.cross_token_group >= 1 else 1
+            if cg > 1:
+                d_head_orig = tile.shape[1] // cg
+                tile_tokens = tile.reshape(-1, d_head_orig)
+                primary_tokens = primary.reshape(-1, d_head_orig)
+            else:
+                tile_tokens = tile
+                primary_tokens = primary
+            n_tokens_in_tile = min(tile_tokens.shape[0], n_real_tokens if n_real_tokens else tile_tokens.shape[0])
+            for i in range(n_tokens_in_tile):
+                err = (tile_tokens[i] - primary_tokens[i]).abs().max().item()
+                if err > bypass_threshold:
+                    self._bypass_map[tile_token_start + i] = _quantize_int8(tile_tokens[i])
+
         # ── Two-stage residual ──
         bases_res, alphas_res = None, None
         bases_shape_M_res = None
         if cfg.use_differential and cfg.diff_strategy == "residual":
-            primary = decode_from_bases(bases, alphas, shape, tile_size=tile_size)
             # Compute residual in transform domain to match primary tile layout.
             transform_mode = getattr(cfg, 'transform_mode', 'none')
             if transform_mode and transform_mode not in ("none", "", None, "fwht"):
@@ -843,9 +905,13 @@ class DSKVCacheStore:
                         R_T.shape, result.shape,
                     )
 
-        # ── Periodic FP16 bypass (P1): override bypass positions ──
+        # ── Periodic FP16 bypass (P1): override bypass positions (INT8 + FP16) ──
             if self._bypass_map:
-                for pos, fp16_tensor in self._bypass_map.items():
+                for pos, (q, s) in self._bypass_map.items():
+                    if pos < result.shape[0]:
+                        result[pos] = _dequantize_int8(q, s).to(result.dtype)
+            if self._bypass_map_fp16:
+                for pos, fp16_tensor in self._bypass_map_fp16.items():
                     if pos < result.shape[0]:
                         result[pos] = fp16_tensor.to(result.dtype)
 
@@ -1031,9 +1097,13 @@ class DSKVCacheStore:
             if transform_pad_rows > 0 and result.shape[0] >= transform_pad_rows:
                 result = result[:-transform_pad_rows]
 
-        # ── Periodic FP16 bypass (P1): override bypass positions ──
+        # ── Periodic FP16 bypass (P1): override bypass positions (INT8 + FP16) ──
         if self._bypass_map:
-            for pos, fp16_tensor in self._bypass_map.items():
+            for pos, (q, s) in self._bypass_map.items():
+                if pos < result.shape[0]:
+                    result[pos] = _dequantize_int8(q, s).to(result.dtype)
+        if self._bypass_map_fp16:
+            for pos, fp16_tensor in self._bypass_map_fp16.items():
                 if pos < result.shape[0]:
                     result[pos] = fp16_tensor.to(result.dtype)
 
@@ -1063,6 +1133,13 @@ class DSKVCacheStore:
                 total += (tensor.numel() * 16) // 8
         if self.raw_buffer is not None and self.buffer_full > 0:
             total += self.buffer_full * d_head * 2
+        if self._bypass_map:
+            for q, _ in self._bypass_map.values():
+                total += q.numel()  # INT8 = 1 byte per element
+            total += len(self._bypass_map) * 4  # float32 scales
+        if self._bypass_map_fp16:
+            for t in self._bypass_map_fp16.values():
+                total += t.numel() * 2  # FP16 = 2 bytes per element
 
         self.memory_bytes = total
         self.compression_ratio = self.fp16_memory_bytes / (total + 1e-12)
