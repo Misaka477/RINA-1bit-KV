@@ -169,6 +169,7 @@ def residual_pursuit_nd(
     initial_momentum: Optional[torch.Tensor] = None,
     initial_integrator2: Optional[torch.Tensor] = None,
     return_momentum: bool = False,
+    encode_mode: str = "sigma_delta",
 ) -> Tuple[Optional[ResidualBases], ResidualAlphas, torch.Tensor]:
     """Core Σ-Δ Residual Binary Pursuit on ``(..., M)``-shaped tensors.
 
@@ -240,6 +241,15 @@ def residual_pursuit_nd(
     return_momentum:
         If ``True``, return ``(bases, alphas, w_hat, momentum, integrator2)``
         so callers can propagate error state to subsequent heads/tiles.
+    encode_mode:
+        ``"sigma_delta"`` (default): standard Σ-Δ encoding with momentum
+        feedback, second-order integrator, and noise shaping.
+        ``"matching_pursuit"``: simplified matching pursuit without
+        momentum/integrator feedback.  ``B = sign(remaining)`` at each
+        step — no state coupling between iterations.  Eliminates
+        structured noise at the cost of slightly slower convergence.
+        In this mode, ``beta``, ``order2_gamma``, ``proj_matrix``,
+        ``proj_beta``, and related parameters have no effect.
 
     Returns
     -------
@@ -307,13 +317,15 @@ def residual_pursuit_nd(
             else:
                 step_eta = proj_beta
 
-        # ---- second-order Σ-Δ target (§8.1.2) ----
-        # Standard first-order: target = remaining + β·momentum
-        # Second-order adds: target = remaining + c₁·β·integrator1 + c₂·γ·integrator2
-        # integrator2 accumulates integrator1 → (1−z⁻¹)² NTF
-        target = remaining + beta * momentum
-        if use_order2:
-            target = target + order2_gamma * order2_c2 * integrator2
+        # ---- target signal ----
+        # Σ-Δ (sigma_delta): target = remaining + β·momentum + γ·c₂·integrator2
+        # Matching Pursuit: target = remaining (no state coupling)
+        if encode_mode == "matching_pursuit":
+            target = remaining
+        else:
+            target = remaining + beta * momentum
+            if use_order2:
+                target = target + order2_gamma * order2_c2 * integrator2
 
         # ---- L1-optimal alpha (Whitepaper §4.1 step 1) ----
         # §10.3: when mask is provided, normalise by valid element count
@@ -333,30 +345,32 @@ def residual_pursuit_nd(
         w_hat = w_hat + contribution
         remaining = w_flat - w_hat
 
-        # ---- store momentum for next step ----
-        # First-order error (quantisation error this step)
-        momentum = target - contribution
+        # ---- momentum & integrator updates (Σ-Δ only) ----
+        if encode_mode != "matching_pursuit":
+            # store momentum for next step
+            # First-order error (quantisation error this step)
+            momentum = target - contribution
 
-        # ---- second-order integrator update (§8.1.2) ----
-        # Integrator2 accumulates the first integrator's output,
-        # creating a second pole at DC for stronger low-freq suppression.
-        if use_order2:
-            integrator2 = order2_c1 * beta * momentum + integrator2
-            # §8.1.12 DC-drift suppression: remove per-tile mean
-            if zero_mean_integrator2:
-                integrator2 = integrator2 - integrator2.mean(dim=-1, keepdim=True)
+            # ---- second-order integrator update (§8.1.2) ----
+            # Integrator2 accumulates the first integrator's output,
+            # creating a second pole at DC for stronger low-freq suppression.
+            if use_order2:
+                integrator2 = order2_c1 * beta * momentum + integrator2
+                # §8.1.12 DC-drift suppression: remove per-tile mean
+                if zero_mean_integrator2:
+                    integrator2 = integrator2 - integrator2.mean(dim=-1, keepdim=True)
 
-        # ---- noise-shaping: inject nullspace-suppressed error into momentum (§8.1) ----
-        # Δ-Σ error feedback: push the nullspace component of residual into
-        # the momentum so the NEXT step's quantiser focuses on signal directions.
-        # We modify momentum (not remaining) to preserve the true residual for
-        # convergence tracking.
-        if use_noise_shape:
-            # e_null = (I - P_signal)·remaining
-            e_null = remaining - torch.matmul(remaining, _proj.T)
-            # momentum ← momentum - step_eta * e_null
-            #   = (prev_target - prev_contribution) - step_eta * e_null
-            momentum = momentum - step_eta * e_null
+            # ---- noise-shaping: inject nullspace-suppressed error into momentum (§8.1) ----
+            # Δ-Σ error feedback: push the nullspace component of residual into
+            # the momentum so the NEXT step's quantiser focuses on signal directions.
+            # We modify momentum (not remaining) to preserve the true residual for
+            # convergence tracking.
+            if use_noise_shape:
+                # e_null = (I - P_signal)·remaining
+                e_null = remaining - torch.matmul(remaining, _proj.T)
+                # momentum ← momentum - step_eta * e_null
+                #   = (prev_target - prev_contribution) - step_eta * e_null
+                momentum = momentum - step_eta * e_null
 
         # ---- mask-based gating: zero out padding regions (§10.3.1) ----
         # After all updates for this step, multiply state tensors by mask
@@ -367,9 +381,10 @@ def residual_pursuit_nd(
         if mask is not None and use_mask_gating:
             w_hat = w_hat * mask.to(w_hat.dtype)
             remaining = remaining * mask.to(remaining.dtype)
-            momentum = momentum * mask.to(momentum.dtype)
-            if use_order2:
-                integrator2 = integrator2 * mask.to(integrator2.dtype)
+            if encode_mode != "matching_pursuit":
+                momentum = momentum * mask.to(momentum.dtype)
+                if use_order2:
+                    integrator2 = integrator2 * mask.to(integrator2.dtype)
 
         alphas_list.append(alpha)
         if return_bases:
@@ -415,6 +430,7 @@ def encode_matrix(
     initial_momentum: Optional[torch.Tensor] = None,
     initial_integrator2: Optional[torch.Tensor] = None,
     return_momentum: bool = False,
+    encode_mode: str = "sigma_delta",
 ) -> Tuple:
     """1-bit tile encoder for a 2-D weight matrix.
 
@@ -611,6 +627,7 @@ def encode_matrix(
                 initial_momentum=initial_momentum[i:i+1] if initial_momentum is not None else None,
                 initial_integrator2=initial_integrator2[i:i+1] if initial_integrator2 is not None else None,
                 return_momentum=return_momentum,
+                encode_mode=encode_mode,
             )
 
             if return_momentum:
@@ -653,6 +670,7 @@ def encode_matrix(
         initial_momentum=initial_momentum,
         initial_integrator2=initial_integrator2,
         return_momentum=return_momentum,
+        encode_mode=encode_mode,
     )
 
     if return_momentum:

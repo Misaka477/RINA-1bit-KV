@@ -18,6 +18,20 @@ from .differential_cancellation import (
     DifferentialCanceller,
     PerturbationStrategy,
 )
+from .tile_4x4 import (
+    encode_tile,
+    decode_tile,
+    encode_4x4_matrix,
+    decode_4x4_matrix,
+    detect_outlier_tiles,
+    dynamic_log_quantize_4bit,
+    dynamic_log_dequantize_4bit,
+    fixed_log_quantize_4bit,
+    fixed_log_dequantize_4bit,
+    linear_quantize_4bit,
+    linear_dequantize_4bit,
+    compute_4x4_metrics,
+)
 
 __all__ = [
     "ResidualBinaryPursuit",
@@ -32,4 +46,16 @@ __all__ = [
     "compute_shared_nullspace_projector",
     "DifferentialCanceller",
     "PerturbationStrategy",
+    "encode_tile",
+    "decode_tile",
+    "encode_4x4_matrix",
+    "decode_4x4_matrix",
+    "detect_outlier_tiles",
+    "dynamic_log_quantize_4bit",
+    "dynamic_log_dequantize_4bit",
+    "fixed_log_quantize_4bit",
+    "fixed_log_dequantize_4bit",
+    "linear_quantize_4bit",
+    "linear_dequantize_4bit",
+    "compute_4x4_metrics",
 ]

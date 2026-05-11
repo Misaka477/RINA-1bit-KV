@@ -71,11 +71,8 @@ class MaskRoute:
 
 def build_routes() -> List[MaskRoute]:
     return [
-        MaskRoute("native",       "native",         adaptive_masking=False, use_mask_gating=False),
-        MaskRoute("baseline",     "baseline",       adaptive_masking=False, use_mask_gating=False),
-        MaskRoute("baseline_mask","baseline_mask",  adaptive_masking=False, use_mask_gating=True),
-        MaskRoute("r1",           "r1",             adaptive_masking=True,  use_mask_gating=False),
-        MaskRoute("r1_mask",      "r1_mask",        adaptive_masking=True,  use_mask_gating=True),
+        MaskRoute("native",   "native",   adaptive_masking=False, use_mask_gating=False),
+        MaskRoute("baseline", "baseline", adaptive_masking=False, use_mask_gating=False),
     ]
 
 
@@ -90,7 +87,12 @@ def make_config(route: MaskRoute, quality: str = "balanced", cross_token_group: 
                  decode_protect_steps: int = 3,
                  decode_protect_layers: str = "all",
                  confidence_mask: bool = False, confidence_beta: float = 0.3,
-                 attn_smoothing_alpha: float = 1.0) -> Optional[DSKVCacheConfig]:
+                 attn_smoothing_alpha: float = 1.0,
+                 k_outlier_dims: int = 0, k_outlier_compress_steps: int = 3,
+                 k_bias_compensate: bool = False,
+                 tile_size: int = 16,
+                 alpha_scheme: str = "dynamic_log", alpha_K_offset: float = 4.0,
+                 outlier_protect: bool = False, outlier_mad_threshold: float = 3.0) -> Optional[DSKVCacheConfig]:
     """Build DSKVCacheConfig from route + quality preset.
 
     quality="balanced": current production settings (n_steps=5, ctg=2)
@@ -112,14 +114,14 @@ def make_config(route: MaskRoute, quality: str = "balanced", cross_token_group: 
         return None
 
     _n = n_steps_override if n_steps_override is not None else (8 if quality == "high" else 5)
-    _nv = n_steps_v_override if n_steps_v_override is not None else _n
+    _nv = n_steps_v_override if n_steps_v_override is not None else 2
 
     if quality == "high":
         return DSKVCacheConfig(
             n_steps=_n,
             n_steps_k=_n,
             n_steps_v=_nv,
-            tile_size=16,
+            tile_size=tile_size,
             beta=0.10,
             use_noise_shaping=True,
             proj_rank=8,
@@ -158,6 +160,13 @@ def make_config(route: MaskRoute, quality: str = "balanced", cross_token_group: 
             attn_smoothing_alpha=attn_smoothing_alpha,
             base_dtype="fp16",
             verbose=False,
+            k_outlier_dims=k_outlier_dims,
+            k_outlier_compress_steps=k_outlier_compress_steps,
+            k_bias_compensate=k_bias_compensate,
+            alpha_scheme=alpha_scheme,
+            alpha_K_offset=alpha_K_offset,
+            outlier_protect=outlier_protect,
+            outlier_mad_threshold=outlier_mad_threshold,
         )
     else:
         # balanced (current defaults)
@@ -165,7 +174,7 @@ def make_config(route: MaskRoute, quality: str = "balanced", cross_token_group: 
             n_steps=_n,
             n_steps_k=_n,
             n_steps_v=_nv,
-            tile_size=16,
+            tile_size=tile_size,
             beta=0.12,
             use_noise_shaping=True,
             proj_rank=8,
@@ -203,6 +212,13 @@ def make_config(route: MaskRoute, quality: str = "balanced", cross_token_group: 
             attn_smoothing_alpha=attn_smoothing_alpha,
             base_dtype="fp16",
             verbose=False,
+            k_outlier_dims=k_outlier_dims,
+            k_outlier_compress_steps=k_outlier_compress_steps,
+            k_bias_compensate=k_bias_compensate,
+            alpha_scheme=alpha_scheme,
+            alpha_K_offset=alpha_K_offset,
+            outlier_protect=outlier_protect,
+            outlier_mad_threshold=outlier_mad_threshold,
         )
 
 
@@ -614,6 +630,19 @@ def main():
                         "Default 3. Higher → more stable but slightly less CR.")
     p.add_argument("--decode-protect-layers", type=str, default="last_4",
                    help="Which layers to protect: 'all', 'last_4', 'first_last', 'none'. Default: last_4.")
+    p.add_argument("--decode-gap-threshold", type=float, default=0.5,
+                   help="Logits Top-2 gap threshold for P1 forking protection. "
+                        "When gap < threshold, triggers extra 1-bit sign residual. Default: 0.5.")
+    p.add_argument("--residual-cos-threshold", type=float, default=0.9999,
+                   help="Cosine similarity threshold for 1-bit sign residual skip. "
+                        "When cos(tile, primary_full) > threshold, skip 1-bit sign encoding. "
+                        "0.9999 = very conservative (only skips near-perfect direction). Default: 0.9999.")
+    p.add_argument("--residual-n-steps", type=int, default=1,
+                   help="Number of Σ-Δ steps for the 1-bit sign residual encoding. "
+                        "Higher = more precise correction but higher bit cost. Default: 1.")
+    p.add_argument("--encode-mode", type=str, default="sigma_delta", choices=["sigma_delta", "matching_pursuit"],
+                   help="Σ-Δ encoding mode: 'sigma_delta' (default, with momentum/integrator) or "
+                        "'matching_pursuit' (no momentum, no structured noise).")
     p.add_argument("--confidence-mask", action="store_true",
                    help="Enable confidence-masked attention (Stage 3). "
                         "Applies per-position penalty to attention scores based on KV encoding quality.")
@@ -622,6 +651,35 @@ def main():
     p.add_argument("--attn-smoothing-alpha", type=float, default=1.0,
                    help="Temporal attention smoothing factor (Stage 4). 1.0 = off. "
                         "0.9 = 90%% current + 10%% previous attention distribution. Default: 1.0.")
+    p.add_argument("--use-fwht", action="store_true",
+                   help="Apply FWHT before Σ-Δ encoding. Distributes quantization error uniformly "
+                        "across frequency components. Zero bit-cost.")
+    p.add_argument("--adaptive-n", action="store_true",
+                   help="Enable per-tile adaptive Σ-Δ step count. High-energy tiles get more bases.")
+    p.add_argument("--beta-decay-start", type=float, default=None,
+                   help="Initial beta for decode steps. If set, beta decays from this value to "
+                        "--beta-decay-end over --beta-decay-tokens decode steps.")
+    p.add_argument("--beta-decay-end", type=float, default=0.02,
+                   help="Final beta after decay completes (default 0.02).")
+    p.add_argument("--beta-decay-tokens", type=int, default=256,
+                   help="Number of decode steps to decay beta over (default 256).")
+    p.add_argument("--k-outlier-dims", type=int, default=0,
+                   help="Phase 2d: K outlier dims protected at FP16 (0=disabled, 2=recommended for 128 dims).")
+    p.add_argument("--k-outlier-compress-steps", type=int, default=3,
+                   help="Phase 2d: n_steps for non-outlier K dims (default 3).")
+    p.add_argument("--k-bias-compensate", action="store_true",
+                    help="Phase 2d: Compute per-head K/V bias during prefill and compensate in reconstruction.")
+    p.add_argument("--tile-size", type=int, default=16,
+                    help="Tile size for encoding. 16 = Phase 2d. 4 = Phase 2e 4x4 tile. Default: 16.")
+    p.add_argument("--alpha-scheme", type=str, default="dynamic_log",
+                    choices=["dynamic_log", "nonlinear_log", "fixed_log", "linear"],
+                    help="Phase 2e: α quantization scheme. Default: dynamic_log.")
+    p.add_argument("--alpha-K-offset", type=float, default=4.0,
+                    help="Phase 2e: dynamic log precision (3.0-5.0). Default: 4.0.")
+    p.add_argument("--outlier-protect", action="store_true",
+                    help="Phase 2e/2d: Enable outlier tile FP16 protection.")
+    p.add_argument("--outlier-mad-threshold", type=float, default=3.0,
+                    help="Phase 2e: MAD multiplier for outlier detection (2.5=tight, 3.0=default).")
     p.add_argument("--json-output", type=str, default="eval_gen_fidelity_results.json",
                    help="JSON output file")
     p.add_argument("--csv-output", type=str, default=None,
@@ -736,7 +794,15 @@ def main():
                           decode_protect_layers=args.decode_protect_layers,
                           confidence_mask=args.confidence_mask,
                           confidence_beta=args.confidence_beta,
-                          attn_smoothing_alpha=args.attn_smoothing_alpha)
+                          attn_smoothing_alpha=args.attn_smoothing_alpha,
+                          k_outlier_dims=args.k_outlier_dims,
+                          k_outlier_compress_steps=args.k_outlier_compress_steps,
+                          k_bias_compensate=args.k_bias_compensate,
+                          tile_size=args.tile_size,
+                          alpha_scheme=args.alpha_scheme,
+                          alpha_K_offset=args.alpha_K_offset,
+                          outlier_protect=args.outlier_protect,
+                          outlier_mad_threshold=args.outlier_mad_threshold)
         label = route.label
 
         _logger.info(f"[{ri+1}/{len(ds_routes)}] {label}: "
@@ -924,7 +990,15 @@ def main():
                               decode_protect_layers=args.decode_protect_layers,
                               confidence_mask=args.confidence_mask,
                               confidence_beta=args.confidence_beta,
-                              attn_smoothing_alpha=args.attn_smoothing_alpha)
+                              attn_smoothing_alpha=args.attn_smoothing_alpha,
+                              k_outlier_dims=args.k_outlier_dims,
+                              k_outlier_compress_steps=args.k_outlier_compress_steps,
+                              k_bias_compensate=args.k_bias_compensate,
+                              tile_size=args.tile_size,
+                              alpha_scheme=args.alpha_scheme,
+                              alpha_K_offset=args.alpha_K_offset,
+                              outlier_protect=args.outlier_protect,
+                              outlier_mad_threshold=args.outlier_mad_threshold)
     report = {
         "config": {
             "model": args.model,
@@ -934,6 +1008,9 @@ def main():
             "measure_kv": args.measure_kv,
             "logits_diff": args.logits_diff,
             "repetition_threshold": args.repetition_threshold,
+            "tile_size": args.tile_size,
+            "alpha_scheme": args.alpha_scheme,
+            "outlier_protect": args.outlier_protect,
             "ds_config": config_dict.to_dict() if config_dict else None,
         },
         "route_results": route_summaries,

@@ -143,6 +143,13 @@ class DSKVCacheConfig:
     n_steps_v: Optional[int] = None
 
     beta: float = 0.10
+    encode_mode: str = "sigma_delta"
+    """Σ-Δ encoding mode. ``"sigma_delta"`` (default): standard Σ-Δ with momentum
+    feedback, second-order integrator, and noise shaping.  ``"matching_pursuit"``:
+    simplified matching pursuit without momentum/integrator feedback — eliminates
+    structured noise at the cost of slightly slower convergence.  In MP mode,
+    ``beta``, ``order2_gamma``, ``proj_matrix``, ``proj_beta``, and related
+    parameters have no effect."""
     proj_beta: float = 0.5
     adaptive_eta: float = 0.0
     order2_gamma: float = 0.20
@@ -156,6 +163,13 @@ class DSKVCacheConfig:
     diff_residual_n_steps: int = 1
     diff_residual_gamma: float = 0.25
     diff_residual_gamma_k: float = 0.25
+
+    # ── Fast Walsh–Hadamard Transform (§8.1.5) ──────────────────────────
+    use_fwht: bool = False
+    """Apply FWHT to each tile before Σ-Δ encoding and inverse-FWHT after
+    decoding.  Distributes quantization error uniformly across frequency
+    components instead of concentrating it on individual coordinate axes.
+    Zero bit-cost.  Default False."""
 
     # ── Adaptive N scheduling ──────────────────────────────────────────
     adaptive_n: bool = False
@@ -260,6 +274,13 @@ class DSKVCacheConfig:
       \"none\"       — disable per-layer protection
     """
 
+    decode_gap_threshold: float = 0.5
+    """Logits Top-2 gap threshold for P1 forking protection.
+    When the gap between top-1 and top-2 logits falls below this threshold,
+    _gap_danger is set on all stores, triggering an extra 1-bit sign residual
+    step during the current token's encoding.  Lower = less sensitive.
+    Recommended range: 0.3 – 1.0."""
+
     # ── Confidence-Masked Attention (Phase 3) ──
     confidence_mask: bool = False
     """If True, apply per-token confidence penalty to attention scores."""
@@ -290,6 +311,69 @@ class DSKVCacheConfig:
     """Number of Σ-Δ steps for adaptive residual encoding.
     1 step = 4 packed-bits ≈ 0.25 bits/element.  Higher = more precise but
     less memory-efficient."""
+
+    # ── CosSim-gated 1-bit sign residual ──
+    residual_cos_threshold: float = 0.9999
+    """Cosine similarity threshold for 1-bit sign residual skip.
+    When cos(tile, primary_full) > threshold, the 1-bit sign encoding is
+    skipped entirely (both step 1 and gap-triggered step 2).
+    Default 0.9999 — only skips when direction is nearly perfect.
+    Lower = more aggressive skipping (more bit savings, less protection)."""
+
+    residual_n_steps: int = 1
+    """Number of Σ-Δ steps for the 1-bit sign residual encoding.
+    Higher = more precise residual correction but higher bit cost.
+    Default 1.  Each additional step adds ~0.25 bits/element."""
+
+    # ── Phase 2e: 4×4 Tile + Log-Quantized α + Outlier Protection ──
+    alpha_scheme: str = "dynamic_log"
+    """α quantization scheme for 4×4 tile encoding.
+    \"dynamic_log\" (default): per-head per-step anchored log-scale.
+    \"fixed_log\": global fixed log range.
+    \"linear\": uniform linear in [0, alpha_max]."""
+    alpha_K_offset: float = 4.0
+    """Precision density for dynamic log α quantization. Higher = finer
+    resolution near alpha_max. Recommended 3.0 – 5.0."""
+    alpha_log_min: float = 1e-4
+    """Lower bound for fixed_log α quantization."""
+    alpha_log_max: float = 10.0
+    """Upper bound for fixed_log α quantization."""
+    outlier_protect: bool = False
+    """If True, detect outlier 4×4 tiles via MAD and store them at FP16.
+    Only used when tile_size == 4."""
+    outlier_mad_threshold: float = 3.0
+    """MAD multiplier for outlier dimension detection. Lower = more aggressive.
+    Recommended: 2.5 (tight VRAM) – 3.0 (default)."""
+    outlier_tile_ratio: float = 0.2
+    """Fraction of tile elements that must be outlier dims to flag the
+    whole tile as FP16. Default 0.2 (3 of 16 elements)."""
+    maxae_fp16_threshold: float = 0.1
+    """Phase 2e precision surgery: if tile MaxAE after N=2 encode > this,
+    force FP16 bypass. Default 0.1."""
+    maxae_boost_threshold: float = 0.05
+    """Phase 2e precision surgery: if tile MaxAE > this but ≤ fp16 threshold,
+    re-encode with boost_n_steps. Default 0.05."""
+    boost_n_steps: int = 3
+    """Phase 2e precision surgery: boosted N for tiles exceeding boost threshold.
+    Default 3 (from base N=2)."""
+    nonlinear_gamma: float = 0.55
+    """Phase 2e precision surgery: gamma for nonlinear_log α codebook.
+    gamma < 1 gives more resolution to high-α range. Default 0.55."""
+
+    # ── Phase 2d: Outlier Isolation (Sparse-RINA) ──
+    k_outlier_dims: int = 0
+    """Number of K dimensions to protect at full FP16 precision.
+    0 = disabled (legacy).  2 = recommended for d_head=128.
+    Outlier dims are detected by column L2 norm and stored as FP16
+    alongside the 1-bit encoded normal dimensions."""
+    k_outlier_compress_steps: int = 3
+    """Number of Σ-Δ steps for non-outlier K dims when k_outlier_dims > 0.
+    Default 3.  Combined with outlier FP16, this achieves effective
+    ~2.3 bit/element while preserving critical dimension precision."""
+    k_bias_compensate: bool = False
+    """If True, compute per-head K bias vector (mean(K_true - K_quant))
+    during prefill and add it back during reconstruction.  This cancels
+    the systematic dot-product offset caused by quantization."""
 
     # ── Pyramid prefill (Phase 3) ──
     prefill_system_protect_len: int = 128

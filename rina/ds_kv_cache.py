@@ -156,6 +156,63 @@ class DSKVCacheStore:
     # ── Calibration (noise shaping) ──
     svd_shaper: Optional[Dict] = None
 
+    # ── Phase 2d: Outlier Isolation (Sparse-RINA) ──
+    outlier_indices: Optional[torch.Tensor] = None
+    """(k_outlier_dims,) int64 — indices of outlier dimensions protected at FP16.
+    Set by encode_kv_cache during prefill.  Used by _encode_and_append_tile
+    and reconstruct_all to split/merge outlier dims."""
+    outlier_fp16: Optional[torch.Tensor] = None
+    """(total_tokens, k_outlier_dims) float16 — full-precision values for
+    outlier dimensions.  Stored alongside the 1-bit encoded normal dimensions.
+    Merged back into the reconstructed tensor by reconstruct_all()."""
+    stored_d_head: Optional[int] = None
+    """Original d_head (including outlier dims) before outlier extraction.
+    Set by encode_kv_cache when k_outlier_dims > 0.  reconstruct_all uses
+    this to reconstruct the full-dimensional tensor."""
+    v_outlier_prune: Optional[torch.Tensor] = None
+    """(k_outlier_dims,) float16 — per-dimension V bias (KV asym. bias correction).
+    Computed as mean(V_true - V_quant) along token dim.  Added to reconstructed
+    V to cancel systematic dot-product offset when k_bias_compensate=True."""
+
+    # ── Phase 2e: 4×4 Tile + Log-Quantized α + Outlier Protection ──
+    tile_config_4x4: Optional[dict] = None
+    """Configuration dict for 4×4 tile encoding (tile_size, n_steps, alpha_scheme,
+    K_offset, etc.).  When set, reconstruct_all routes to decode_4x4_matrix."""
+    meta_alpha_packed: Optional[torch.Tensor] = None
+    """(n_tiles,) uint16 — per-tile [outlier_flag(bit15)|α_N(4)|...|α_1(4)]."""
+    signs_packed: Optional[torch.Tensor] = None
+    """(n_steps, n_tiles) uint16 or (n_steps, n_superblocks, 4) uint16 —
+    16 sign bits per tile per step. Dense for per-tile, or 3D for superblock."""
+    signs_flat: Optional[torch.Tensor] = None
+    """(total_sign_entries,) uint16 — compact per-superblock sign entries
+    for non-FP16 sub-tiles. Used with superblock format."""
+    sign_offsets: Optional[torch.Tensor] = None
+    """(n_superblocks+1,) int32 — cumulative offsets into signs_flat."""
+    alphas_max_fp16_4x4: Optional[torch.Tensor] = None
+    """(n_steps,) float16 — per-step alpha_max for dynamic log anchoring."""
+    outlier_fp16_4x4: Optional[torch.Tensor] = None
+    """(n_outlier_tiles, 16) float16 — FP16 values for outlier tiles."""
+    orig_shape_4x4: Optional[Tuple[int, int]] = None
+    """Original (T, d_head) shape before 4×4 encoding."""
+    _encoded_shape_4x4: Optional[Tuple[int, int]] = None
+    """Shape of the encoded portion (excluding incremental tail)."""
+    norm_mu_4x4: Optional[torch.Tensor] = None
+    """(n_tiles,) float16 — per-tile mean for normalization encoding."""
+    norm_sigma_4x4: Optional[torch.Tensor] = None
+    """(n_tiles,) float16 — per-tile std for normalization encoding."""
+    residual_patch_count: Optional[torch.Tensor] = None
+    """(n_tiles,) int32 — number of sparse residual patches per tile."""
+    residual_patch_idx: Optional[torch.Tensor] = None
+    """(total_patches,) int16 — flat list of element indices within each tile."""
+    residual_patch_val: Optional[torch.Tensor] = None
+    """(total_patches,) float16 — flat list of patch values (original space)."""
+    group_scales_4x4: Optional[torch.Tensor] = None
+    """(3,) float16 — per-group alpha_max scale factors for tile-local amax."""
+    plane_refine_alpha_flat: Optional[torch.Tensor] = None
+    """(n_entries,) uint8 — per-plane alpha values for refinement step(s)."""
+    plane_refine_alpha_offsets: Optional[torch.Tensor] = None
+    """(n_sb+1,) int32 — cumulative offsets into plane_refine_alpha_flat."""
+
     # ── Periodic FP16 bypass (P1 anchor token refresh) ──
     _bypass_map: Dict[int, Tuple[torch.Tensor, float]] = field(default_factory=dict)
     """Position → (int8_tensor, scale).  Each entry stores a quantized INT8
@@ -168,6 +225,16 @@ class DSKVCacheStore:
     """Position → FP16 tensor.  Used by pyramid prefill (Phase 3) for critical
     system/tail tokens that require full precision.  reconstruct_all checks
     this map after _bypass_map, so FP16 entries take priority."""
+
+    # ── 常态 1-bit 符号残差 gap danger 标志 ──
+    _gap_danger: bool = False
+    """When True, _encode_and_append_tile appends an extra 1-bit sign residual
+    step to protect forking trajectories detected by P1 logits gap analysis."""
+
+    # ── Ring buffer for multi-turn conversation reset ──
+    _recent_ring: Optional[List[torch.Tensor]] = field(default=None)
+    """Ring buffer of recent original FP16 K/V vectors for turn_flush() recovery.
+    Stores up to 128 tokens from incremental append calls."""
 
     # ── Incremental buffer (§5) ──
     raw_buffer: Optional[torch.Tensor] = None      # (B, d_head) FP16, B < tile_size
@@ -239,18 +306,21 @@ class DSKVCacheStore:
 
     @property
     def n_tokens(self) -> int:
-        """Total logical tokens: encoded + buffered.
-        Uses original_n_tokens when cross_token_group > 1."""
-        # When cross_token_group > 1, orig_shape was reshaped;
-        # original_n_tokens = pre-reshape count (or total for per-tile incremental)
+        """Total logical tokens: encoded + buffered."""
         if self.original_n_tokens is not None and self.cross_token_group > 1:
             return self.original_n_tokens + self.buffer_full
+        if self.orig_shape_4x4 is not None:
+            return self.orig_shape_4x4[0] + self.buffer_full
         encoded = self.orig_shape[0] if self.orig_shape is not None else 0
         return encoded + self.buffer_full
 
     @property
     def n_tiles(self) -> int:
         """Number of encoded tiles in bit-packed store."""
+        if self.tile_config_4x4 is not None and self.meta_alpha_packed is not None:
+            if self.meta_alpha_packed.ndim == 2:
+                return self.meta_alpha_packed.shape[0] * 4  # 4 sub-tiles per superblock
+            return self.meta_alpha_packed.shape[0]
         if self.bases is None:
             return 0
         return self.bases.shape[1]
@@ -331,6 +401,14 @@ class DSKVCacheStore:
                 encoded = self.orig_shape[0]
                 self.orig_shape = (encoded + B, d_head)
             return initial_momentum, initial_integrator2
+
+        # ── Ring buffer: capture original FP16 for turn_flush recovery ──
+        if self._recent_ring is None:
+            self._recent_ring = []
+        for i in range(B):
+            self._recent_ring.append(new_vec[i:i+1].half())
+            if len(self._recent_ring) > 128:
+                self._recent_ring.pop(0)
 
         # ── V-orthogonal: rotate BEFORE storing so raw_buffer is always in rotated space ──
         # This avoids the reconstruct_all bug where the buffer tail (in original space)
@@ -428,12 +506,29 @@ class DSKVCacheStore:
                 pad_rows = tile_size - effective_tile_size
                 tile = F.pad(tile_raw, (0, 0, 0, pad_rows), mode='constant', value=0.0)
 
-                ret_momentum, ret_integrator2 = self._encode_and_append_tile(
-                    tile, cfg=cfg, svd_shaper=svd_shaper, is_v=is_v,
-                    initial_momentum=momentum, initial_integrator2=integrator2,
-                    n_real_tokens=effective_tile_size,
-                    tile_token_start=token_offset,
-                )
+                # ── 8×8 incremental encode path ──
+                if self.tile_config_4x4 is not None:
+                    from modules.tile_4x4 import encode_4x4_matrix
+                    tcfg = self.tile_config_4x4
+                    inc_enc = encode_4x4_matrix(
+                        tile, n_steps=tcfg.get("n_steps", 3),
+                        tile_size=tcfg.get("tile_size", tile_size),
+                        alpha_scheme=tcfg.get("alpha_scheme", "nonlinear_log"),
+                        K_offset=tcfg.get("K_offset", 4.0),
+                        log_min=tcfg.get("log_min", 1e-4),
+                        log_max=tcfg.get("log_max", 10.0),
+                        nonlinear_gamma=tcfg.get("nonlinear_gamma", 0.55),
+                        packed=True, use_relative_threshold=True,
+                    )
+                    self._merge_4x4_encoded(inc_enc)
+                    ret_momentum, ret_integrator2 = initial_momentum, initial_integrator2
+                else:
+                    ret_momentum, ret_integrator2 = self._encode_and_append_tile(
+                        tile, cfg=cfg, svd_shaper=svd_shaper, is_v=is_v,
+                        initial_momentum=momentum, initial_integrator2=integrator2,
+                        n_real_tokens=effective_tile_size,
+                        tile_token_start=token_offset,
+                    )
                 momentum, integrator2 = ret_momentum, ret_integrator2
                 token_offset += effective_tile_size
 
@@ -449,6 +544,79 @@ class DSKVCacheStore:
                     self.raw_buffer = None
 
         return momentum, integrator2
+
+    def _merge_4x4_encoded(self, inc: dict):
+        """Merge incremental 8×8 encode result into existing store fields."""
+        if self.meta_alpha_packed is None:
+            self.meta_alpha_packed = inc["meta_alpha_packed"]
+            self.signs_flat = inc.get("signs_flat")
+            self.sign_offsets = inc.get("sign_offsets")
+            self.signs_packed = inc.get("signs_packed")
+            self.outlier_fp16_4x4 = inc.get("outlier_fp16")
+            self.orig_shape_4x4 = inc["orig_shape"]
+            self.alphas_max_fp16_4x4 = inc.get("alphas_max_fp16",
+                self.alphas_max_fp16_4x4)
+            self.norm_mu_4x4 = inc.get("norm_mu")
+            self.norm_sigma_4x4 = inc.get("norm_sigma")
+            self.residual_patch_count = inc.get("residual_patch_count")
+            self.residual_patch_idx = inc.get("residual_patch_idx")
+            self.residual_patch_val = inc.get("residual_patch_val")
+            self.group_scales_4x4 = inc.get("group_scales")
+            self.plane_refine_alpha_flat = inc.get("plane_refine_alpha_flat")
+            self.plane_refine_alpha_offsets = inc.get("plane_refine_alpha_offsets")
+            return
+
+        # Concatenate meta (same ndim)
+        if self.meta_alpha_packed.ndim == inc["meta_alpha_packed"].ndim:
+            self.meta_alpha_packed = torch.cat(
+                [self.meta_alpha_packed, inc["meta_alpha_packed"]], dim=0)
+        if "signs_flat" in inc and inc["signs_flat"] is not None and self.signs_flat is not None:
+            self.signs_flat = torch.cat([self.signs_flat, inc["signs_flat"]], dim=0)
+        if "sign_offsets" in inc and inc["sign_offsets"] is not None and self.sign_offsets is not None:
+            last_offset = self.sign_offsets[-1].item()
+            new_soff = inc["sign_offsets"][1:] + last_offset
+            self.sign_offsets = torch.cat([self.sign_offsets, new_soff])
+        if "signs_packed" in inc and inc["signs_packed"] is not None and self.signs_packed is not None:
+            self.signs_packed = torch.cat([self.signs_packed, inc["signs_packed"]], dim=1)
+        if "outlier_fp16" in inc and inc["outlier_fp16"] is not None:
+            if self.outlier_fp16_4x4 is not None:
+                self.outlier_fp16_4x4 = torch.cat(
+                    [self.outlier_fp16_4x4, inc["outlier_fp16"]], dim=0)
+            else:
+                self.outlier_fp16_4x4 = inc["outlier_fp16"]
+        if self.orig_shape_4x4 is not None:
+            inc_rows = inc["orig_shape"][0]
+            self.orig_shape_4x4 = (self.orig_shape_4x4[0] + inc_rows,
+                                   self.orig_shape_4x4[1])
+        if getattr(self, '_encoded_shape_4x4', None) is not None:
+            inc_rows = inc["orig_shape"][0]
+            self._encoded_shape_4x4 = (self._encoded_shape_4x4[0] + inc_rows,
+                                       self._encoded_shape_4x4[1])
+        if "norm_mu" in inc and inc["norm_mu"] is not None:
+            if self.norm_mu_4x4 is not None:
+                self.norm_mu_4x4 = torch.cat([self.norm_mu_4x4, inc["norm_mu"]], dim=0)
+            else:
+                self.norm_mu_4x4 = inc["norm_mu"]
+        if "norm_sigma" in inc and inc["norm_sigma"] is not None:
+            if self.norm_sigma_4x4 is not None:
+                self.norm_sigma_4x4 = torch.cat([self.norm_sigma_4x4, inc["norm_sigma"]], dim=0)
+            else:
+                self.norm_sigma_4x4 = inc["norm_sigma"]
+        if "residual_patch_count" in inc and inc["residual_patch_count"] is not None:
+            if self.residual_patch_count is not None:
+                self.residual_patch_count = torch.cat([self.residual_patch_count, inc["residual_patch_count"]], dim=0)
+            else:
+                self.residual_patch_count = inc["residual_patch_count"]
+        if "residual_patch_idx" in inc and inc["residual_patch_idx"] is not None:
+            if self.residual_patch_idx is not None:
+                self.residual_patch_idx = torch.cat([self.residual_patch_idx, inc["residual_patch_idx"]], dim=0)
+            else:
+                self.residual_patch_idx = inc["residual_patch_idx"]
+        if "residual_patch_val" in inc and inc["residual_patch_val"] is not None:
+            if self.residual_patch_val is not None:
+                self.residual_patch_val = torch.cat([self.residual_patch_val, inc["residual_patch_val"]], dim=0)
+            else:
+                self.residual_patch_val = inc["residual_patch_val"]
 
     def _encode_and_append_tile(
         self,
@@ -673,6 +841,49 @@ class DSKVCacheStore:
                 if err > bypass_threshold:
                     self._bypass_map[tile_token_start + i] = _quantize_int8(tile_tokens[i])
 
+        # ── 噪声脱钩器：在编码前注入随机 dither 破坏 Σ-Δ 结构化噪声 ──
+        # ── 常态 1-bit 符号残差（CosSim 门控 + gap 追加第 2 步）──
+        primary_full = decode_from_bases(bases, alphas, shape, tile_size=tile_size)
+        if bases_res is not None:
+            if self.diff_gamma > 0:
+                bases_res_unpacked = unpack_bases(bases_res)
+                diff_hat = decode_from_bases(bases_res_unpacked, alphas_res, shape, tile_size=tile_size)
+                primary_full = primary_full + self.diff_gamma * diff_hat
+
+        cos_sim = F.cosine_similarity(tile.flatten().unsqueeze(0), primary_full.flatten().unsqueeze(0)).item()
+        if cos_sim < getattr(cfg, 'residual_cos_threshold', 0.9999):
+            _logger.debug(f"1-bit sign triggered: cos_sim={cos_sim:.6f}")
+            residual_sign = tile - primary_full
+            residual_steps = getattr(cfg, 'residual_n_steps', 1)
+
+            bases_s1, alphas_s1, _, _ = encode_matrix(
+                residual_sign, n_steps=residual_steps, tile_size=tile_size,
+                beta=cfg.beta, proj_matrix=None, proj_beta=0.0, adaptive_eta=False,
+            )
+            bases_s1 = pack_bases(bases_s1)
+            alphas_s1 = alphas_s1.to(torch.float16)
+
+            if residual_steps == 1 and getattr(self, '_gap_danger', False):
+                bases_s2, alphas_s2, _, _ = encode_matrix(
+                    residual_sign, n_steps=1, tile_size=tile_size,
+                    beta=cfg.beta, proj_matrix=None, proj_beta=0.0, adaptive_eta=False,
+                )
+                bases_s2 = pack_bases(bases_s2)
+                alphas_s2 = alphas_s2.to(torch.float16)
+                bases_s1 = torch.cat([bases_s1, bases_s2], dim=0)
+                alphas_s1 = torch.cat([alphas_s1, alphas_s2], dim=0)
+                self._gap_danger = False
+
+            if bases_res is not None:
+                bases_res = torch.cat([bases_res, bases_s1], dim=0)
+                alphas_res = torch.cat([alphas_res, alphas_s1], dim=0)
+            else:
+                bases_res = bases_s1
+                alphas_res = alphas_s1
+                bases_shape_M_res = bases_s1.shape[-1]
+        else:
+            bases_s1 = None
+
         alphas = alphas.to(torch.float16)
 
         # ── Align residual n_steps with existing residual store ──
@@ -839,6 +1050,42 @@ class DSKVCacheStore:
         each segment is decoded independently to avoid tile-alignment padding
         contamination across bulk and incremental encoding passes.
         """
+        # ── Phase 2e: 4×4 Tile decode path ────────────────────────────────
+        if self.tile_config_4x4 is not None:
+            from modules.tile_4x4 import decode_4x4_matrix
+            encoded = {
+                "meta_alpha_packed": self.meta_alpha_packed,
+                "signs_packed": self.signs_packed,
+                "signs_flat": self.signs_flat,
+                "sign_offsets": self.sign_offsets,
+                "alphas_max_fp16": self.alphas_max_fp16_4x4,
+                "outlier_fp16": self.outlier_fp16_4x4,
+                "orig_shape": self._encoded_shape_4x4 if self.raw_buffer is not None and self.buffer_full > 0 else self.orig_shape_4x4,
+                "tile_config": self.tile_config_4x4,
+                "norm_mu": self.norm_mu_4x4,
+                "norm_sigma": self.norm_sigma_4x4,
+                "residual_patch_count": self.residual_patch_count,
+                "residual_patch_idx": self.residual_patch_idx,
+                "residual_patch_val": self.residual_patch_val,
+                "group_scales": self.group_scales_4x4,
+                "plane_refine_alpha_flat": self.plane_refine_alpha_flat,
+                "plane_refine_alpha_offsets": self.plane_refine_alpha_offsets,
+            }
+            result = decode_4x4_matrix(encoded)
+
+            # Append raw buffer tail (if any)
+            if self.raw_buffer is not None and self.buffer_full > 0:
+                tail = self.raw_buffer[:self.buffer_full].to(torch.float32)
+                result = torch.cat([result, tail], dim=0)
+
+            # V un-rotation
+            if self.v_rotation_matrix is not None:
+                R_T = self.v_rotation_matrix.T.to(result.dtype)
+                if R_T.shape[-1] == result.shape[-1]:
+                    result = result @ R_T
+
+            return result
+
         # ── Determine transform inversion policy ────────────────────────
         transform_mode = getattr(self, 'transform_mode', 'none')
         transform_decisions = getattr(self, 'transform_decisions', None)
@@ -959,6 +1206,9 @@ class DSKVCacheStore:
                 for pos, fp16_tensor in self._bypass_map_fp16.items():
                     if pos < result.shape[0]:
                         result[pos] = fp16_tensor.to(result.dtype)
+
+            # ── Phase 2d: Outlier merge (Sparse-RINA) ────────────────────
+            result = _merge_outlier_dims(self, result)
 
             return result
 
@@ -1152,6 +1402,9 @@ class DSKVCacheStore:
                 if pos < result.shape[0]:
                     result[pos] = fp16_tensor.to(result.dtype)
 
+        # ── Phase 2d: Outlier merge (Sparse-RINA) ────────────────────────
+        result = _merge_outlier_dims(self, result)
+
         return result
 
     # ------------------------------------------------------------------
@@ -1160,6 +1413,40 @@ class DSKVCacheStore:
 
     def update_stats(self):
         """Recalculate memory footprint."""
+        # ── Phase 2e: 4×4 Tile memory accounting ───────────────────────────
+        if self.tile_config_4x4 is not None:
+            orig_shape = self.orig_shape_4x4 or (0, 0)
+            d_head = orig_shape[1]
+            total_tokens = self.n_tokens
+            self.fp16_memory_bytes = total_tokens * d_head * 2
+
+            total = 0
+            if self.meta_alpha_packed is not None:
+                total += self.meta_alpha_packed.numel() * self.meta_alpha_packed.element_size()
+            if self.signs_packed is not None:
+                total += self.signs_packed.numel() * 2  # dense 3D or flat 1D
+            if getattr(self, 'signs_flat', None) is not None:
+                total += self.signs_flat.numel() * 2
+            if getattr(self, 'sign_offsets', None) is not None:
+                total += self.sign_offsets.numel() * 4  # int32 = 4 bytes
+            # alphas_max: float16 = 2 bytes each
+            if self.alphas_max_fp16_4x4 is not None:
+                total += self.alphas_max_fp16_4x4.numel() * 2
+            # outlier FP16 tiles: 16 half-floats = 32 bytes each
+            if self.outlier_fp16_4x4 is not None:
+                total += self.outlier_fp16_4x4.numel() * 2
+            # norm params: float16 per tile
+            if self.norm_mu_4x4 is not None:
+                total += self.norm_mu_4x4.numel() * 2
+            if self.norm_sigma_4x4 is not None:
+                total += self.norm_sigma_4x4.numel() * 2
+            if self.raw_buffer is not None and self.buffer_full > 0:
+                total += self.buffer_full * d_head * 2
+
+            self.memory_bytes = total
+            self.compression_ratio = self.fp16_memory_bytes / (total + 1e-12)
+            return
+
         d_head = self.orig_shape[1] if self.orig_shape is not None else (
             self._original_mat_shape[1] if self._original_mat_shape is not None else
             self.raw_buffer.shape[1] if self.raw_buffer is not None else 0
@@ -1185,6 +1472,9 @@ class DSKVCacheStore:
         if self._bypass_map_fp16:
             for t in self._bypass_map_fp16.values():
                 total += t.numel() * 2  # FP16 = 2 bytes per element
+
+        if self.outlier_fp16 is not None:
+            total += self.outlier_fp16.numel() * 2  # FP16 outlier dims
 
         self.memory_bytes = total
         self.compression_ratio = self.fp16_memory_bytes / (total + 1e-12)
@@ -1214,6 +1504,11 @@ def _encode_single_path(
       §A Roadmap 1 — Adaptive Bit-Rate Masking (per-tile outlier/anchor detection)
       §A Roadmap 3 — DCT/DWT/Hybrid orthogonal transform engine
     """
+    import builtins, os
+    if not hasattr(_encode_single_path, '_diag_done'):
+        _encode_single_path._diag_done = True
+        with open(os.path.join(os.path.dirname(__file__), '..', 'diag_output.txt'), 'a') as f:
+            f.write(f"_encode_single_path called: n_steps={n_steps}\n")
     tile_size = cfg.tile_size
     tile_d = tile_size ** 2
     per_tile_proj = proj_matrix
@@ -1292,6 +1587,7 @@ def _encode_single_path(
     encode_kwargs = dict(
         tile_size=tile_size,
         beta=cfg.beta,
+        encode_mode=cfg.encode_mode,
         proj_matrix=per_tile_proj,
         proj_beta=cfg.proj_beta if per_tile_proj is not None else 0.0,
         adaptive_eta=cfg.adaptive_eta,
@@ -1325,7 +1621,9 @@ def _encode_single_path(
         adaptive_kwargs = {
             k: v for k, v in encode_kwargs.items()
             if k not in ("initial_momentum", "initial_integrator2", "return_momentum",
-                         "use_fwht", "zero_mean_integrator2", "use_mask_gating")
+                         "use_fwht", "zero_mean_integrator2", "use_mask_gating",
+                         "adaptive_masking", "mask_smooth_threshold", "mask_outlier_threshold",
+                         "mask_proj_beta_boost", "mask_n_steps_boost")
         }
         result = adaptive_encode_matrix(
             mat_enc,
@@ -1467,6 +1765,138 @@ def encode_kv_cache(
     n_steps_k = cfg.get_n_steps_k()
     n_steps_v = cfg.get_n_steps_v()
     transform_mode = getattr(cfg, 'transform_mode', 'none')
+    k_for_phase2e = k.clone() if cfg.tile_size in (4, 8) else None
+
+    # ── Phase 2d: Outlier Isolation ──────────────────────────────────────
+    k_outlier_idx = None
+    k_outlier_fp16 = None
+    k_outlier_stored_d_head = None
+    if cfg.k_outlier_dims > 0:
+        k_norms = k.norm(p=2, dim=0)  # (d_head,) per-column L2
+        k_outlier_idx = k_norms.topk(min(cfg.k_outlier_dims, d_head)).indices
+        k_outlier_idx = k_outlier_idx.sort().values  # sorted for easy merge
+        all_dims = torch.arange(d_head, device=k.device)
+        k_outlier_mask = torch.isin(all_dims, k_outlier_idx)
+        k_outlier_fp16 = k[:, k_outlier_mask].to(torch.float16)  # (T, k_outlier_dims)
+        k_outlier_stored_d_head = d_head
+        k = k[:, ~k_outlier_mask]  # (T, d_head - k_outlier_dims) for encoding
+        # Use compressed steps for normal dims
+        n_steps_k = cfg.k_outlier_compress_steps
+
+    # ── Phase 2e: 4×4 Tile + Log-Quantized α + Outlier Protection ─────────
+    if cfg.tile_size == 4 or cfg.tile_size == 8:
+        from modules.tile_4x4 import (
+            encode_4x4_matrix, detect_outlier_tiles,
+        )
+        use_ts = cfg.tile_size
+        n_steps_k_4x4 = cfg.get_n_steps_k()
+        n_steps_v_4x4 = cfg.get_n_steps_v()
+
+        k_4x4 = k_for_phase2e if k_for_phase2e is not None else k
+
+        # Detect outlier tiles (K path only; V uses same mask for now)
+        k_outlier_mask_4x4 = None
+        if cfg.outlier_protect:
+            k_outlier_mask_4x4, _, _ = detect_outlier_tiles(
+                k_4x4.float(), Q_h=None, tile_size=use_ts,
+                mad_threshold=cfg.outlier_mad_threshold,
+                outlier_ratio=cfg.outlier_tile_ratio,
+            )
+
+        # Encode K
+        k_enc_4x4 = encode_4x4_matrix(
+            k_4x4.float(), n_steps=n_steps_k_4x4,
+            alpha_scheme=cfg.alpha_scheme,
+            K_offset=cfg.alpha_K_offset,
+            log_min=cfg.alpha_log_min,
+            log_max=cfg.alpha_log_max,
+            outlier_tile_mask=k_outlier_mask_4x4,
+            tile_size=use_ts,
+            maxae_fp16_threshold=getattr(cfg, 'maxae_fp16_threshold', 0.1),
+            maxae_boost_threshold=getattr(cfg, 'maxae_boost_threshold', 0.05),
+            boost_n_steps=getattr(cfg, 'boost_n_steps', 4),
+            nonlinear_gamma=getattr(cfg, 'nonlinear_gamma', 0.55),
+            use_relative_threshold=True,
+        )
+
+        # Encode V
+        v_rotation = None
+        if cfg.v_orthogonal_transform:
+            v_rotation = _build_v_rotation(k_4x4)
+        v_rotated_4x4 = (v.float() @ v_rotation.float()) if v_rotation is not None else v.float()
+
+        v_outlier_mask_4x4 = None
+        if cfg.outlier_protect:
+            v_outlier_mask_4x4, _, _ = detect_outlier_tiles(
+                v_rotated_4x4, Q_h=None, tile_size=use_ts,
+                mad_threshold=cfg.outlier_mad_threshold,
+                outlier_ratio=cfg.outlier_tile_ratio,
+            )
+
+        v_enc_4x4 = encode_4x4_matrix(
+            v_rotated_4x4, n_steps=n_steps_v_4x4,
+            alpha_scheme=cfg.alpha_scheme,
+            K_offset=cfg.alpha_K_offset,
+            log_min=cfg.alpha_log_min,
+            log_max=cfg.alpha_log_max,
+            outlier_tile_mask=v_outlier_mask_4x4,
+            tile_size=use_ts,
+            maxae_fp16_threshold=getattr(cfg, 'maxae_fp16_threshold', 0.1),
+            maxae_boost_threshold=getattr(cfg, 'maxae_boost_threshold', 0.05),
+            boost_n_steps=getattr(cfg, 'boost_n_steps', 4),
+            nonlinear_gamma=getattr(cfg, 'nonlinear_gamma', 0.55),
+            use_relative_threshold=True,
+        )
+
+        k_store = DSKVCacheStore(
+            tile_size=use_ts,
+            tile_config_4x4=k_enc_4x4["tile_config"],
+            meta_alpha_packed=k_enc_4x4["meta_alpha_packed"],
+            signs_packed=k_enc_4x4.get("signs_packed"),
+            signs_flat=k_enc_4x4.get("signs_flat"),
+            sign_offsets=k_enc_4x4.get("sign_offsets"),
+            alphas_max_fp16_4x4=k_enc_4x4["alphas_max_fp16"],
+            outlier_fp16_4x4=k_enc_4x4["outlier_fp16"],
+            orig_shape_4x4=k_enc_4x4["orig_shape"],
+            _encoded_shape_4x4=k_enc_4x4["orig_shape"],
+            norm_mu_4x4=k_enc_4x4.get("norm_mu"),
+            norm_sigma_4x4=k_enc_4x4.get("norm_sigma"),
+            residual_patch_count=k_enc_4x4.get("residual_patch_count"),
+            residual_patch_idx=k_enc_4x4.get("residual_patch_idx"),
+            residual_patch_val=k_enc_4x4.get("residual_patch_val"),
+            group_scales_4x4=k_enc_4x4.get("group_scales"),
+            plane_refine_alpha_flat=k_enc_4x4.get("plane_refine_alpha_flat"),
+            plane_refine_alpha_offsets=k_enc_4x4.get("plane_refine_alpha_offsets"),
+            cross_token_group=1,
+            original_n_tokens=n_tokens_original,
+        )
+        v_store = DSKVCacheStore(
+            tile_size=use_ts,
+            tile_config_4x4=v_enc_4x4["tile_config"],
+            meta_alpha_packed=v_enc_4x4["meta_alpha_packed"],
+            signs_packed=v_enc_4x4.get("signs_packed"),
+            signs_flat=v_enc_4x4.get("signs_flat"),
+            sign_offsets=v_enc_4x4.get("sign_offsets"),
+            alphas_max_fp16_4x4=v_enc_4x4["alphas_max_fp16"],
+            outlier_fp16_4x4=v_enc_4x4["outlier_fp16"],
+            orig_shape_4x4=v_enc_4x4["orig_shape"],
+            _encoded_shape_4x4=v_enc_4x4["orig_shape"],
+            norm_mu_4x4=v_enc_4x4.get("norm_mu"),
+            norm_sigma_4x4=v_enc_4x4.get("norm_sigma"),
+            residual_patch_count=v_enc_4x4.get("residual_patch_count"),
+            residual_patch_idx=v_enc_4x4.get("residual_patch_idx"),
+            residual_patch_val=v_enc_4x4.get("residual_patch_val"),
+            group_scales_4x4=v_enc_4x4.get("group_scales"),
+            plane_refine_alpha_flat=v_enc_4x4.get("plane_refine_alpha_flat"),
+            plane_refine_alpha_offsets=v_enc_4x4.get("plane_refine_alpha_offsets"),
+            v_rotation_matrix=v_rotation,
+            cross_token_group=1,
+            original_n_tokens=n_tokens_original,
+        )
+
+        k_store.update_stats()
+        v_store.update_stats()
+        return k_store, v_store
 
     proj_matrix = None
     if cfg.use_noise_shaping and cfg.proj_rank > 0 and cfg.proj_beta > 0:
@@ -1550,6 +1980,49 @@ def encode_kv_cache(
             beta=cfg.beta, proj_matrix=None, proj_beta=0.0, adaptive_eta=False,
         )
 
+    # ── 常态 1-bit 符号残差（prefill bulk path, CosSim 门控）──
+    _k_primary = decode_from_bases(k_bases, k_alphas, k_shape, tile_size=cfg.tile_size,
+                                    use_fwht=getattr(cfg, 'use_fwht', False))
+    _k_full = _k_primary
+    if k_bases_res is not None and cfg.get_diff_residual_gamma_k() > 0:
+        _k_diff = decode_from_bases(k_bases_res, k_alphas_res, k_shape_res, tile_size=cfg.tile_size)
+        _k_full = _k_full + cfg.get_diff_residual_gamma_k() * _k_diff
+    _k_cos_sim = F.cosine_similarity(k_enc.flatten().unsqueeze(0), _k_full.flatten().unsqueeze(0)).item()
+    if _k_cos_sim < getattr(cfg, 'residual_cos_threshold', 0.9999):
+        _k_residual_sign = k_enc - _k_full
+        _k_bases_s, _k_alphas_s, _, _ = encode_matrix(
+            _k_residual_sign, n_steps=getattr(cfg, 'residual_n_steps', 1), tile_size=cfg.tile_size,
+            beta=cfg.beta, proj_matrix=None, proj_beta=0.0, adaptive_eta=False,
+        )
+        if k_bases_res is not None:
+            k_bases_res = torch.cat([k_bases_res, _k_bases_s], dim=0)
+            k_alphas_res = torch.cat([k_alphas_res, _k_alphas_s], dim=0)
+        else:
+            k_bases_res = _k_bases_s
+            k_alphas_res = _k_alphas_s
+            k_shape_res = _k_bases_s.shape[1:]
+
+    _v_primary = decode_from_bases(v_bases, v_alphas, v_shape, tile_size=cfg.tile_size,
+                                    use_fwht=getattr(cfg, 'use_fwht', False))
+    _v_full = _v_primary
+    if v_bases_res is not None and cfg.diff_residual_gamma > 0:
+        _v_diff = decode_from_bases(v_bases_res, v_alphas_res, v_shape_res, tile_size=cfg.tile_size)
+        _v_full = _v_full + cfg.diff_residual_gamma * _v_diff
+    _v_cos_sim = F.cosine_similarity(v_enc.flatten().unsqueeze(0), _v_full.flatten().unsqueeze(0)).item()
+    if _v_cos_sim < getattr(cfg, 'residual_cos_threshold', 0.9999):
+        _v_residual_sign = v_enc - _v_full
+        _v_bases_s, _v_alphas_s, _, _ = encode_matrix(
+            _v_residual_sign, n_steps=getattr(cfg, 'residual_n_steps', 1), tile_size=cfg.tile_size,
+            beta=cfg.beta, proj_matrix=None, proj_beta=0.0, adaptive_eta=False,
+        )
+        if v_bases_res is not None:
+            v_bases_res = torch.cat([v_bases_res, _v_bases_s], dim=0)
+            v_alphas_res = torch.cat([v_alphas_res, _v_alphas_s], dim=0)
+        else:
+            v_bases_res = _v_bases_s
+            v_alphas_res = _v_alphas_s
+            v_shape_res = _v_bases_s.shape[1:]
+
     k_bases_M = k_bases.shape[-1]
     v_bases_M = v_bases.shape[-1]
 
@@ -1572,6 +2045,10 @@ def encode_kv_cache(
         transform_decisions=k_xform_decisions if k_xform_decisions is not None else None,
         masking_decisions=k_mask_decisions if k_mask_decisions is not None else None,
         transform_pad_rows=k_pad_rows,
+        # Phase 2d: Outlier isolation
+        outlier_indices=k_outlier_idx,
+        outlier_fp16=k_outlier_fp16,
+        stored_d_head=k_outlier_stored_d_head,
         _encode_segments=[(
             0,
             k_bases.shape[1],
@@ -1583,7 +2060,7 @@ def encode_kv_cache(
     )
     # Store pad tokens for unreshape
     k_store._cross_token_pad = k_pad  # type: ignore
-    k_store._original_mat_shape = (n_tokens_original, d_head)
+    k_store._original_mat_shape = (n_tokens_original, k_outlier_stored_d_head or d_head)
 
     v_store = DSKVCacheStore(
         tile_size=cfg.tile_size,
@@ -1851,3 +2328,42 @@ def _flush_incremental_buffer(
     store.full_k_hat = None
     store.update_stats()
     return store
+
+
+def _merge_outlier_dims(store: DSKVCacheStore, result: torch.Tensor) -> torch.Tensor:
+    """Merge outlier FP16 dims back into the reconstructed tensor.
+
+    When outlier_indices is set, *result* has shape
+    ``(tokens, d_head_compressed)``.  This fills in the missing outlier
+    dimensions from ``outlier_fp16``, returning the full
+    ``(tokens, original_d_head)`` tensor.
+
+    No-op when outlier protection is not active.
+    """
+    if store.outlier_indices is None or store.outlier_fp16 is None:
+        return result
+    if store.stored_d_head is None:
+        return result
+
+    orig_d_head = store.stored_d_head
+    out_indices = store.outlier_indices.to(result.device)
+    out_fp16 = store.outlier_fp16
+
+    compressed_d_head = result.shape[-1]
+    if compressed_d_head >= orig_d_head:
+        return result
+
+    n_tokens = result.shape[0]
+    full = torch.zeros(n_tokens, orig_d_head, dtype=result.dtype, device=result.device)
+
+    all_dims = torch.arange(orig_d_head, device=result.device)
+    outlier_mask = torch.isin(all_dims, out_indices)
+
+    # Non-outlier positions from decoded result
+    full[:, ~outlier_mask] = result
+
+    # Outlier positions from FP16 buffer
+    n_fill = min(n_tokens, out_fp16.shape[0])
+    full[:n_fill, outlier_mask] = out_fp16[:n_fill].to(dtype=result.dtype)
+
+    return full

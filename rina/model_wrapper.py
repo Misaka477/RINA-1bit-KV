@@ -102,6 +102,10 @@ class DSKVCacheModel:
             model.config.hidden_size // model.config.num_attention_heads
         )
 
+        # Phase 2d: Per-head K bias for dot-product compensation
+        self._k_biases: Dict[tuple, torch.Tensor] = {}  # (layer, head) → (d_head,) bias vector
+        self._v_biases: Dict[tuple, torch.Tensor] = {}  # (layer, head) → (d_head,) bias vector
+
         # Stage 3: Confidence-masked attention state
         self._confidence_vectors: List[Optional[torch.Tensor]] = []
         self._apply_confidence: bool = False
@@ -160,10 +164,11 @@ class DSKVCacheModel:
 
             # ── Protected layer (§8.1.8): skip 1-bit encoding ──────────
             is_protected = layer_idx in self.cfg.protected_layers
+            use_outlier = getattr(self.cfg, 'k_outlier_dims', 0) > 0 and not is_protected
             use_dual = (prefill_n is not None
                         and prefill_n != layer_cfg.get_n_steps_k()
                         and not is_protected
-                        and not use_prefill_protect)
+                        and not use_prefill_protect) or use_outlier
 
             layer_k_stores = []
             layer_v_stores = []
@@ -232,6 +237,24 @@ class DSKVCacheModel:
                     prefill_k_stores.append(None)
                     prefill_v_stores.append(None)
 
+                # ── Phase 2d: Per-head bias computation ──────────────────
+                if self.cfg.k_bias_compensate and not is_protected:
+                    effective_k_store = prefill_k if use_dual else k_store
+                    k_quant = effective_k_store.reconstruct_all(
+                        layer_cfg.tile_size, layer_cfg.use_differential,
+                    )
+                    k_quant = k_quant[:T].float()  # trim to original length
+                    k_bias = k_h.mean(dim=0) - k_quant.mean(dim=0)
+                    self._k_biases[(layer_idx, h)] = k_bias
+
+                    effective_v_store = prefill_v if use_dual else v_store
+                    v_quant = effective_v_store.reconstruct_all(
+                        layer_cfg.tile_size, layer_cfg.use_differential,
+                    )
+                    v_quant = v_quant[:T].float()
+                    v_bias = v_h.mean(dim=0) - v_quant.mean(dim=0)
+                    self._v_biases[(layer_idx, h)] = v_bias
+
                 layer_k_stores.append(k_store)
                 layer_v_stores.append(v_store)
 
@@ -247,6 +270,7 @@ class DSKVCacheModel:
         past_key_values,
         new_token_idx: int = -1,
         decode_step: int = 0,
+        gap_protect: bool = False,
     ):
         """Append the LAST token's K/V from model's new past to our DS stores.
 
@@ -265,9 +289,23 @@ class DSKVCacheModel:
         steps.  High early beta pushes early quantization error into high
         frequencies; low late beta prevents oscillation when integrators
         are saturated.
+
+        gap_protect:
+            When True, sets _gap_danger on all stores BEFORE encoding,
+            triggering an extra 1-bit sign residual step in _encode_and_append_tile
+            for the current token's K/V.  Triggered by P1 logits gap detection.
         """
         # Compute decayed beta for this decode step (once for all layers)
         decayed_beta = self.cfg.get_beta_for_decode_step(decode_step)
+
+        # ── Gap danger propagation: set BEFORE encoding across all stores ──
+        if gap_protect:
+            for layer_idx in range(self._num_layers):
+                k_stores = self._ds_layers[layer_idx][0]
+                v_stores = self._ds_layers[layer_idx][1]
+                for h in range(len(k_stores)):
+                    k_stores[h]._gap_danger = True
+                    v_stores[h]._gap_danger = True
 
         for layer_idx in range(self._num_layers):
             k_full, v_full = _past_get_kv(past_key_values, layer_idx)
@@ -374,6 +412,14 @@ class DSKVCacheModel:
                         else:
                             k_recon = torch.cat([k_prefill, k_recon], dim=0)
                             v_recon = torch.cat([v_prefill, v_recon], dim=0)
+
+                # ── Phase 2d: Bias compensation ─────────────────────────
+                if (layer_idx, h) in self._k_biases:
+                    k_bias = self._k_biases[(layer_idx, h)].to(device=k_recon.device, dtype=torch.float32)
+                    k_recon = k_recon.float() + k_bias.unsqueeze(0)
+                if (layer_idx, h) in self._v_biases:
+                    v_bias = self._v_biases[(layer_idx, h)].to(device=v_recon.device, dtype=torch.float32)
+                    v_recon = v_recon.float() + v_bias.unsqueeze(0)
 
                 k_list.append(k_recon)
                 v_list.append(v_recon)
@@ -542,13 +588,20 @@ class DSKVCacheModel:
                     )
 
                 # output.past_key_values = [DS_decoded_0..T-1, raw_KV_T]
+                # ── Logits gap detection (P1 forking protection) ──
+                logits = output.logits[0, -1, :]
+                top2_values, _ = torch.topk(logits.float(), 2)
+                gap = (top2_values[0] - top2_values[1]).item()
+                gap_threshold = getattr(self.cfg, 'decode_gap_threshold', 0.5)
+                gap_protect = (gap < gap_threshold)
+
                 # Incrementally encode only the NEW token (position -1)
                 # step=1 → decode_step=0 (the first auto-regressive token after prefill)
-                self._append_incremental(output.past_key_values, new_token_idx=-1, decode_step=step - 1)
+                self._append_incremental(output.past_key_values, new_token_idx=-1, decode_step=step - 1,
+                                         gap_protect=gap_protect)
                 past = self._build_past_from_ds()
 
                 # ── Sample next token ──
-                logits = output.logits[0, -1, :]
                 if temperature > 0 and do_sample:
                     logits = logits / temperature
                     if top_p < 1.0:
@@ -715,3 +768,80 @@ class DSKVCacheModel:
         print(
             f"{'TOTAL':>6} {total_fp16:>10.2f} {total_ds:>10.2f} {total_fp16/(total_ds+1e-12):>8.1f}x"
         )
+
+    # ------------------------------------------------------------------
+    # Multi-turn conversation reset
+    # ------------------------------------------------------------------
+
+    def turn_flush(self, keep_tail: int = 32):
+        """Flush the last N decode tokens as FP16 bypass for next turn.
+
+        Writes _bypass_map_fp16 entries for the last ``keep_tail`` decode
+        tokens on each store.  These replace the Σ-Δ encoded values with
+        original FP16 during the next decode pass's reconstruct_all.
+
+        Uses the _recent_ring buffer populated by append_incremental to
+        recover original K/V values that were Σ-Δ encoded.
+        """
+        for layer_idx in range(self._num_layers):
+            k_stores = self._ds_layers[layer_idx][0]
+            v_stores = self._ds_layers[layer_idx][1]
+            for h in range(len(k_stores)):
+                k_s = k_stores[h]
+                v_s = v_stores[h]
+                if k_s.n_tokens == 0:
+                    continue
+                n_total = k_s.n_tokens
+                start = max(0, n_total - keep_tail)
+                for pos in range(start, n_total):
+                    k_ring = k_s._recent_ring
+                    if k_ring is not None and len(k_ring) > 0:
+                        ring_idx = pos - max(0, n_total - len(k_ring))
+                        if 0 <= ring_idx < len(k_ring):
+                            k_s._bypass_map_fp16[pos] = k_ring[ring_idx].to(torch.float16)
+                    v_ring = v_s._recent_ring
+                    if v_ring is not None and len(v_ring) > 0:
+                        ring_idx = pos - max(0, n_total - len(v_ring))
+                        if 0 <= ring_idx < len(v_ring):
+                            v_s._bypass_map_fp16[pos] = v_ring[ring_idx].to(torch.float16)
+
+    def chat(self, messages: List[Dict], max_new_tokens: int = 128,
+             temperature: float = 1.0, top_p: float = 1.0, do_sample: bool = False,
+             turn_flush_tail: int = 32) -> List[str]:
+        """Multi-turn chat with turn boundary reset.
+
+        Each turn's FP16 bypass flush resets cumulative Σ-Δ quantization
+        error for the next conversation turn, preventing error accumulation
+        across multi-round dialogues.
+
+        Parameters
+        ----------
+        messages:
+            List of message dicts in the format expected by the tokenizer's
+            chat template (e.g. ``[{"role": "user", "content": "..."}]``).
+        max_new_tokens:
+            Maximum new tokens per turn.
+        turn_flush_tail:
+            Number of tail tokens to FP16-bypass at each turn boundary.
+            Default 32.
+
+        Returns
+        -------
+        List of generated text strings, one per turn.
+        """
+        results = []
+        for turn_idx, msg in enumerate(messages):
+            prompt = self.tokenizer.apply_chat_template(
+                [msg], tokenize=False, add_generation_prompt=True,
+            )
+            result = self.generate(
+                prompt,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                top_p=top_p,
+                do_sample=do_sample,
+            )
+            results.append(result)
+            if turn_idx < len(messages) - 1:
+                self.turn_flush(keep_tail=turn_flush_tail)
+        return results

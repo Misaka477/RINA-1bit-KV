@@ -141,6 +141,7 @@ class UnifiedEncoder:
         encode_kwargs = dict(
             tile_size=tile_size,
             beta=cfg.beta,
+            encode_mode=cfg.encode_mode,
             proj_matrix=per_tile_proj,
             proj_beta=cfg.proj_beta if per_tile_proj is not None else 0.0,
             adaptive_eta=cfg.adaptive_eta,
