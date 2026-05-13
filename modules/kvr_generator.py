@@ -9,6 +9,7 @@ from transformers import LogitsProcessorList, TemperatureLogitsWarper, TopKLogit
 from transformers import RepetitionPenaltyLogitsProcessor
 from .kvr_hook import KVRHook
 from .kvr_retrieval import _apply_rotary
+from .kvr_triton import run_fused_attn
 
 
 class KVRGenerator:
@@ -19,7 +20,7 @@ class KVRGenerator:
         self.n_layers = cfg.num_hidden_layers
         self.n_kv = cfg.num_key_value_heads
         self.n_q = cfg.num_attention_heads
-        self.d_head = cfg.head_dim or (cfg.hidden_size // self.n_q)
+        self.d_head = getattr(cfg, 'head_dim', None) or (cfg.hidden_size // self.n_q)
         self.hidden_size = cfg.hidden_size
         self.g = self.n_q // self.n_kv
         self.vocab_size = cfg.vocab_size
@@ -112,12 +113,7 @@ class KVRGenerator:
 
             k_cat = torch.cat([win_k, ret_k.to(win_k.dtype)], dim=0)
             v_cat = torch.cat([win_v, ret_v.to(win_v.dtype)], dim=0)
-            scale = self.d_head ** 0.5
-
-            qg = q_rot.float().view(self.n_kv, self.g, self.d_head)
-            scores = torch.einsum('hgd, thd -> h g t', qg, k_cat.float())
-            w = F.softmax(scores / scale, dim=-1)
-            attn_out = torch.einsum('h g t, t h d -> h g d', w, v_cat.float()).reshape(self.n_q, self.d_head)
+            attn_out = run_fused_attn(q_rot, k_cat, v_cat)
 
             # o_proj + residual
             h = h + attn.o_proj(attn_out.reshape(-1).half())

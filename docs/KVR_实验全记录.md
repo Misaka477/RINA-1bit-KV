@@ -6,6 +6,8 @@ KVR（Key‑predicted Value Retrieval）是一种替代 Transformer 全量注意
 
 **关键策略：懒初始化。** 上下文 ≤ 窗大小时退化为纯窗注意力（无检索无额外开销），首次检测到窗口 eviction 时才构建检索索引。
 
+**Triton 算子加速：** `score_kernel`（检索搜索 10.5x）+ `fused_attn_kernel`（注意力 1.7x）。分组 softmax 确认 Triton 不如 cuBLAS tensor core，不作他用。
+
 ---
 
 ## 1. 命名演变
@@ -56,16 +58,18 @@ calibrate(k_pre, v):
   3. 对 V_residual 每头 int2 量化, 存储 vr_scales (n_kv×1)
 
 append(k_pre, v):
-  1. int4 量化 K_pre → k_codes
+  1. int4 量化 K_pre → k_codes (int8 存储, 1 B/值)
   2. V_pred = W·(K_pre − μ_k) + μ_v
   3. V_residual = v − V_pred
-  4. int2 量化 V_residual → vr_codes
+  4. int2 量化 V_residual → vr_codes (int8 存储, 1 B/值)
 
 retrieve_topk(q_post_rope):
   1. 反量化 k_codes → K_pre → 旋转(K_pre, pos_id) → K_post
-  2. Q_post·K_post / √d → top-K（排除窗内位置）
+  2. Q_post·K_post / √d → top-K（排除窗内位置，Python 路径）
   3. 对 top-K: V_final = W·(K_pre − μ_k) + μ_v + 反量化(vr_codes)
   4. 返回 K_post + V_final 给级联注意力
+
+> **位压缩状态：** int4 K + int2 V 残差已实现，但位压缩（int4→2 per byte、int2→4 per byte）因 Triton kernel 的 unpack 逻辑有 bug 导致 NIAH 从 100% 降至 42%，暂不使用。
 ```
 
 ### 2.4 懒检索触发机制
@@ -135,6 +139,10 @@ for step in range(max_new):
 | 12 | `einsum('b n g t, t n d')` 产生 ~1TB 中间变量 | 16K OOM | 改为 per-KV-head matmul |
 | 13 | Gruppen softmax 因果掩码错置 | scores 被错误冻结 | 仅对 `cstart >= n_past` 的块施加掩码 |
 | 14 | 懒检索构建时取的是窗口内容（错误） | 检索包含窗外 token | 用 `captured_k[:n_ret]` 取窗口外 token |
+| 15 | Score kernel k_scales 取法错误 | scores 完全错误 | `s0 = scales[2*i]`, `s1 = scales[2*i+1]`（匹配 int4 打包隔二取值）|
+| 16 | SDPA GQA 扩维方向错误 | expand 后 Q/K 不对齐 | `unsqueeze(2)`（n_kv 后）→ 而非 `unsqueeze(1)`（n_kv 前），GQA expand 是 per-head 重复 |
+| 17 | Triton `half` 非 `tl.constexpr` | 编译错误 | 加 `HALF: tl.constexpr` 参数 |
+| 18 | V 重建 8 次冗余 W 矩阵乘 | step 慢 2x | `_reconstruct_v` 改为一次性计算全部 KV head 后切片 |
 
 ---
 
@@ -151,66 +159,120 @@ for step in range(max_new):
 
 ## 5. 存储
 
+**当前状态：** int4 K 和 int2 V 残差均以 raw int8 存储（1 B/值），未做位压缩。
+
 ### 1B @ 128K
 
 | 组件 | 精度 | 大小 |
 |:----|:----|:----:|
-| K int4 codes | 0.5 B/值 | 256 MB |
-| V int2 residual codes | 0.25 B/值 | 128 MB |
+| K int4 codes (raw int8) | 1 B/值 | 1.0 GB |
+| V int2 residual codes (raw int8) | 1 B/值 | 1.0 GB |
 | W 矩阵 | fp16 | 8 MB |
-| 窗 fp16 K+V | fp16 | 64 MB |
-| **总计** | | **~456 MB** |
+| 窗 fp16 K+V | fp16 | 67 MB |
+| **KVR 总计** | **2 B/值** | **~2.1 GB** |
+| vs full fp16 KV 4.0 GB | | **~1.9x** |
 
 ### 12B @ 128K（推算）
 
 | 组件 | 大小 |
 |:----|:----:|
-| K int4 codes | 1.0 GB |
-| V int2 residual | 0.5 GB |
+| K int4 codes (raw int8) | 5.0 GB |
+| V int2 residual codes (raw int8) | 5.0 GB |
 | W 矩阵 | 80 MB |
 | 窗 fp16 K+V | 268 MB |
-| **总计** | **~1.9 GB** |
+| **KVR 总计** | **~10.4 GB** |
+| vs full fp16 KV 21.5 GB | **~2.1x** |
+
+> 若修复位压缩（int4→2 per byte, int2→4 per byte），存储可降至 0.75 B/值，约 **5.3x** 压缩。当前因 Triton kernel 的 unpack 逻辑 bug，位压缩不影响数值 roundtrip（diff=0）但导致推理时 scores 计算错误，暂关闭。
 
 ---
 
 ## 6. 注意力与加速
 
-| 上下文 | 全量注意力 | KVR | 加速比 |
-|:------|:--------:|:---:|:-----:|
-| 2K | 4.2M FLOPs | 4.2M | 1x |
+| 上下文 | 全量注意力 | KVR (FLOPs) | 加速比 |
+|:------|:--------:|:----------:|:-----:|
+| 2K | 4.2M | 4.2M | 1x |
 | 32K | 67.1M | 4.2M | **16x** |
 | 128K | 268.4M | 4.2M | **64x** |
 
 KVR 永远 2176 个 attention 点（2048 窗 + 128 检索），不随上下文增长。
 
+### Step 实际耗时（1B 模型，检索活跃）
+
+| 上下文 | Step avg | 说明 |
+|:-----:|:-------:|:------|
+| 550 tok（窗外 38） | **36ms** | 检索搜索范围小 |
+| 4K（窗外 ~2.4K） | **131ms** | score_kernel 10.5x + 级联注意力 1.7x + V 重建批量化 |
+| 16K（窗外 ~11K） | **140ms** | 同上，top-K 排序时间增长 |
+
 ---
 
-## 7. 测试结果
+## 7. Triton 算子
 
-### 7.1 NIAH（上一版，非懒检索）
+### 已实现的算子
 
-| 配置 | 通过率 |
-|:----|:------:|
-| 128‑2048 ctx, win=64 | 100% (15/15) |
+| Kernel | 加速 | 用途 | 状态 |
+|:------|:---:|:-----|:-----|
+| `score_kernel` | 10.5x | 检索搜索（unpack + deq + RoPE + dot） | ⚠️ 位压缩 unpack 逻辑有 bug，当前用 Python fallback |
+| `fused_attn_kernel` | 1.7x | 级联注意力 | ✅ 可用 |
 
-### 7.2 极端长上下文（当前版，懒检索 + 分组 softmax）
+### 当前路径选择
+
+`compute_all_scores` 根据存储格式自动切换：
+
+```
+if self.k_packed is not None:  → Triton score_kernel（位压缩模式）
+else:                          → Python 路径（raw int8 模式，NIAH 100%）
+```
+
+当前默认用 Python 路径（非压缩 raw int8），精度最优。Triton kernel 待修复 unpack 逻辑后可切换回。
+
+### 已验证但不使用的算子
+
+| Kernel | 结论 | 原因 |
+|:------|:----|:------|
+| `group_softmax_kernel` | 正确但慢 | Triton 无法调 tensor core 做 batch matmul，cuBLAS einum 是此场景最优解 |
+
+### 下一步方向
+
+| 方向 | 预期 Step 加速 | 可行性 |
+|:----|:-------------:|:------|
+| `torch.compile`（需 WSL2/Linux） | step ~5ms | ❌ Windows 下 Triton API 与 inductor 不兼容 |
+| 融合 CUDA kernel | step ~1ms | ❌ 需 WSL2 开发调试 |
+| 修复位压缩 unpack | 存储 2x→5x | ⏳ Triton kernel unpack 需离线调试 |
+
+---
+
+## 8. 测试结果
+
+### 8.1 NIAH（懒检索，Python 路径）
+
+| 配置 | 通过率 | 说明 |
+|:----|:------:|:-----|
+| 128‑1024 ctx, win=64 | **100% (9/9)** | Python 路径（raw int8, `_deq_k` + `_rotary` + dot）|
+| 2048 ctx, depth≤0.25, win=64 | **100% (1/1)** | 更深测试因 prefill `model(input_ids)` OOM 无法完成 |
+| Triton kernel（位压缩） | 42% | unpack 逻辑有 bug，暂不使用 |
+
+> **注意：** 历史测试中的 93-100% 与当前 100% 结果一致。中间降至 42% 是位压缩 + Triton kernel 的 bug 导致，Python 路径（raw int8 存储）下 NIAH 完全正常。
+
+### 8.2 极端长上下文
 
 | 上下文 | Native | KVR |
 |:-----:|:-----:|:---:|
-| 4K | ✅ 1.3s, 2.69 GB | ✅ 2.6s+6.3s, **3.60 GB** 文本一致 |
-| 16K | ✅ 3.2s, 3.82 GB | ✅ 16.8s+20.5s, **4.14 GB** |
-| 64K | ❌ OOM | ✅ 224s+230s, **7.05 GB** |
+| 4K | ✅ 1.3s, 2.69 GB | **3.0s prefill + 131ms/step, 3.60 GB** |
+| 16K | ✅ 3.2s, 3.82 GB | **10.8s prefill + 140ms/step, 4.20 GB** |
+| 64K | ❌ OOM | ✅ Python group softmax 不 OOM（~7GB 推算）|
 
-### 7.3 AR 生成（短文本）
+### 8.3 AR 生成
 
 | 模式 | JS | 文本 |
 |:----|:--:|:-----|
 | window=2048 + ret | 0.0000 | 与 native 逐 token 相同 |
-| window=64 + ret | ~0.8 | 前 34 tok 相同，后分叉但流畅 |
+| window=512 + ret | ~0.2 | 略有分叉（"France" vs "the country"，均合理）|
 
 ---
 
-## 8. 文件结构
+## 9. 文件结构
 
 ### KVR 核心文件
 
@@ -219,8 +281,9 @@ modules/
   kvr_window.py        — WindowBuffer: fp16 K/V 循环缓冲
   kvr_retrieval.py     — RetrievalIndex: int4 K + int2 V 残差 + W 预测器
                         _apply_rotary / _rotate_half / _reverse_rotary
-  kvr_hook.py          — KVRHook: 块预填充 + 懒检索 + 分组 softmax + hook 注入
+  kvr_hook.py          — KVRHook: 块预填充 + 懒检索 + Python 分组 softmax
   kvr_generator.py     — KVRGenerator: 增量生成循环（无 LLaMA 依赖）
+  kvr_triton.py        — Triton kernels: score_kernel + fused_attn_kernel
 ```
 
 ### 评估脚本
@@ -228,23 +291,20 @@ modules/
 ```
 scripts/evaluation/
   eval_kvr_extreme.py   — 极端长上下文测试（4K/16K/64K）
-  eval_fwr_niah.py      — NIAH 框架（fwr 命名遗留，暂未改）
-  eval_fwr_wres.py      — W+int2 残差综合测试
-  eval_kvr_long.py      — 长上下文 AR 测试
+  eval_fwr_niah.py      — NIAH 框架（fwr 命名遗留）
+  eval_fwr_generation.py— AR 生成 + JS 基准测试
   eval_kvr_scenarios.py — 6 风险场景测试
   eval_v_residual.py    — V 预测消融实验
   eval_v_quant_bits.py  — V 量化 bit 扫描
-  eval_v_from_k.py      — K→V 线性预测验证
-  eval_v_from_kpost.py  — post-RoPE K→V 验证
-  eval_v_cache_test.py  — V 缓存 bit 宽度测试
 ```
 
 ### JSON 结果文件（可删）
 
 ```
 eval_kvr_extreme.json
-eval_kvr_long.json
 eval_kvr_scenarios.json
+eval_fwr_niah_final.json
+eval_fwr_ar_vpred.json
 eval_fwr_*.json         （多个）
 ```
 
@@ -253,14 +313,16 @@ eval_fwr_*.json         （多个）
 ```
 docs/
   KVR_实验全记录.md      — 完整性文档（本文）
-  FWR_ARCHITECTURE.md   — 英文旧版（可删）
 ```
 
 ---
 
-## 9. 已知局限
+## 10. 已知局限
 
 1. **AR 路径分叉**：当 `window_size ≪ context` 时，int4 K 搜索可能将相似段 token 排序错误。分叉后文本始终语法正确、语义合理。
 2. **V 预测仅从 prefill 拟合**：W 矩阵只在 prefill 时拟合一次。风险低但需验证。
 3. **64K prompt 极度重复时生成质量下降**：非 KVR 问题，换非重复 prompt 应恢复正常。
-4. **Block prefill 比原生慢**（4K: 2.6s vs 1.3s）。Python 层循环开销，可用 `torch.compile` 加速。
+4. **Block prefill vs hook prefill 取舍**：hook prefill（`model(input_ids)` + 钩子）可产生精确隐藏状态使 NIAH 100%，但 8K+ 上下文可能 OOM。块预填充适合长上下文但 layer 15 cos=0.819。
+5. **Step 速度受 Windows 无 Triton inductor 限制**：`torch.compile` 在 Windows 上不工作，需 WSL2/Linux 才能达到 ~5ms/step。
+6. **Triton 分组 softmax 不如 cuBLAS einsum 快**：tensor core 的 batch matmul 是分组 softmax 的最优解，Triton 不适合此场景。
+7. **位压缩暂停使用**：Triton `score_kernel` 的 unpack 逻辑有 bug，开启后 NIAH 从 100% 降至 42%。roundtrip 验证 unpack 数值正确（diff=0），问题在 unpack -> RoPE 链路。修复后存储可从 2x 提升至 5x+。
