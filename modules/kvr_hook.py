@@ -184,9 +184,12 @@ class KVRHook:
             # Retrieval K/V (lazy: only if built and window is full)
             ret = self.retrievals[li]
             if self._ret_weight > 0 and self._retrieval_built and ret.n_stored > 0:
+                ctx = self._context_len
                 n_stored = ret.n_stored
-                exc_start = max(0, n_stored - nw)
-                exc_end = n_stored
+                exc_start = max(0, ctx - nw)
+                exc_end = min(n_stored, ctx)
+                if exc_start >= exc_end:
+                    exc_start = exc_end = 0
                 ret_k, ret_v = ret.retrieve_topk(q_last, n_q=self.n_q,
                                                   exclude_start=exc_start, exclude_end=exc_end)
             else:

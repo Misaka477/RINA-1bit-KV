@@ -105,9 +105,12 @@ class KVRGenerator:
 
             # Query retrieval (excluding window positions)
             ret = self.kvr.retrievals[li]
+            ctx = self.kvr._context_len
             n_stored = ret.n_stored
-            excl_s = max(0, n_stored - nw)
-            excl_e = n_stored
+            excl_s = max(0, ctx - nw)
+            excl_e = min(n_stored, ctx)
+            if excl_s >= excl_e:
+                excl_s = excl_e = 0
             ret_k, ret_v = ret.retrieve_topk(q_rot.float(), n_q=self.n_q,
                                               exclude_start=excl_s, exclude_end=excl_e)
 
