@@ -6,6 +6,22 @@ V = W(K_pre) + dequantize(V_residual). No fp16 V storage.
 import torch
 import torch.nn.functional as F
 
+# Lazy-loaded CUDA kernel (compiled once on first use)
+_kvr_cuda_fn = None
+
+def _cuda_compute_scores(*args):
+    global _kvr_cuda_fn
+    if _kvr_cuda_fn is None:
+        try:
+            from .kvr_cuda import run_score_kernel_cuda
+            _kvr_cuda_fn = run_score_kernel_cuda
+        except Exception:
+            return None
+    try:
+        return _kvr_cuda_fn(*args)
+    except Exception:
+        return None
+
 
 def _rotate_half(x):
     d2 = x.shape[-1] // 2
@@ -126,6 +142,18 @@ class RetrievalIndex:
         return (v_base + vr_dq).float()
 
     @torch.no_grad()
+    def _ensure_capacity(self, needed):
+        if needed <= self.k_packed.shape[0]:
+            return
+        new_cap = max(needed, self.k_packed.shape[0] * 2)
+        k_ext = torch.zeros(new_cap - self.k_packed.shape[0], self.n_kv, self.d_head // 2,
+                            device=self.device, dtype=torch.uint8)
+        self.k_packed = torch.cat([self.k_packed, k_ext], dim=0)
+        vr_ext = torch.zeros(new_cap - self.vr_packed.shape[0], self.n_kv, self.d_head // 4,
+                             device=self.device, dtype=torch.uint8)
+        self.vr_packed = torch.cat([self.vr_packed, vr_ext], dim=0)
+
+    @torch.no_grad()
     def append(self, k_pre_rope, v=None):
         if self.k_scales is None:
             raise RuntimeError("Call calibrate() first")
@@ -133,7 +161,8 @@ class RetrievalIndex:
         k_step = 2 * self.k_scales / 16
         kq = torch.round(k_pre_rope.float() / k_step.float()).clamp(-8, 7).to(torch.int8)
         kp = self._pack_int4(kq.unsqueeze(0))
-        self.k_packed = torch.cat([self.k_packed, kp])
+        self._ensure_capacity(self.n_stored + 1)
+        self.k_packed[self.n_stored] = kp[0]
 
         if v is not None and self.W is not None:
             v_pred = self._predict_v(k_pre_rope.float().reshape(-1).unsqueeze(0)).reshape(1, self.n_kv, self.d_head)
@@ -141,9 +170,11 @@ class RetrievalIndex:
             vr_step = 2 * self.vr_scales / 4
             vrq = torch.round(v_res / vr_step).clamp(-2, 1).to(torch.int8)
             vrp = self._pack_int2(vrq)
-            self.vr_packed = torch.cat([self.vr_packed, vrp])
+            self._ensure_capacity(self.n_stored + 1)
+            self.vr_packed[self.n_stored] = vrp[0]
         else:
-            self.vr_packed = torch.cat([self.vr_packed, torch.zeros(1, self.n_kv, self.d_head // 4, device=self.device, dtype=torch.uint8)])
+            self._ensure_capacity(self.n_stored + 1)
+            self.vr_packed[self.n_stored] = 0
 
         self.n_stored += 1
 
@@ -152,7 +183,9 @@ class RetrievalIndex:
         n = k_pre_all.shape[0]
         k_step = 2 * self.k_scales / 16
         kq = torch.round(k_pre_all.float() / k_step).clamp(-8, 7).to(torch.int8)
-        self.k_packed = self._pack_int4(kq)
+        extra = max(1024, n // 2)
+        self.k_packed = torch.cat([self._pack_int4(kq),
+            torch.zeros(extra, self.n_kv, self.d_head // 2, device=self.device, dtype=torch.uint8)], dim=0)
 
         if self.W is not None:
             k_flat = k_pre_all.reshape(n, -1).float()
@@ -160,9 +193,10 @@ class RetrievalIndex:
             v_res = v_all.float() - v_pred
             vr_step = 2 * self.vr_scales / 4
             vrq = torch.round(v_res / vr_step).clamp(-2, 1).to(torch.int8)
-            self.vr_packed = self._pack_int2(vrq)
+            self.vr_packed = torch.cat([self._pack_int2(vrq),
+                torch.zeros(extra, self.n_kv, self.d_head // 4, device=self.device, dtype=torch.uint8)], dim=0)
         else:
-            self.vr_packed = torch.zeros(n, self.n_kv, self.d_head // 4, device=self.device, dtype=torch.uint8)
+            self.vr_packed = torch.zeros(n + extra, self.n_kv, self.d_head // 4, device=self.device, dtype=torch.uint8)
 
         self.n_stored = n
 
@@ -193,14 +227,19 @@ class RetrievalIndex:
 
     @torch.no_grad()
     def compute_all_scores(self, q_post_rope):
-        """Compute Q·K scores for all stored tokens x KV heads (Python fallback).
-        Triton score_kernel confirmed correct for d=4 but has numerical differences
-        at d=64 on triton-windows (community edition). Python path gives NIAH 100%.
-        """
+        """Compute Q·K scores for all stored tokens × KV heads."""
         d = self.d_head; n_kv_ret = self.n_kv; n_stored_ret = self.n_stored
         g = q_post_rope.shape[0] // n_kv_ret
-        scores = torch.empty(n_stored_ret, n_kv_ret, device=self.device)
         q_avg = q_post_rope.view(n_kv_ret, g, d).mean(dim=1)
+
+        try:
+            result = _cuda_compute_scores(q_avg, self.k_packed, self.k_scales, self.cos, self.sin)
+            if result is not None:
+                return result
+        except Exception:
+            pass
+
+        scores = torch.empty(n_stored_ret, n_kv_ret, device=self.device)
         aidx = torch.arange(n_stored_ret, device=self.device)
         for kvh in range(n_kv_ret):
             kp = self._deq_k(kvh)
