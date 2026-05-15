@@ -1,0 +1,17 @@
+{
+  "(16384, 0.25)": {
+    "native_acc": 1.0,
+    "win512_acc": 1.0,
+    "win512_needle_in_window": false
+  },
+  "(16384, 0.5)": {
+    "native_acc": 1.0,
+    "win512_acc": 1.0,
+    "win512_needle_in_window": false
+  },
+  "(16384, 0.75)": {
+    "native_acc": 1.0,
+    "win512_acc": 1.0,
+    "win512_needle_in_window": false
+  }
+}

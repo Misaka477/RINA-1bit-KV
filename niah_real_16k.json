@@ -1,0 +1,23 @@
+{
+  "0.25": {
+    "acc": 1.0,
+    "native_acc": 1.0,
+    "text": " KILO42. I am so _much_.\u201d\n\n\u201c_.\u201d\n\n\u201c_.\u201d\n\n\u201c_",
+    "native_text": " KILO42. 1. 2. 3. 4. 5.",
+    "in_window": false
+  },
+  "0.5": {
+    "acc": 1.0,
+    "native_acc": 1.0,
+    "text": " KILO42. I am _so_._\nI _so_.\u201d\n\u201c_.\u201d\n\u201c",
+    "native_text": " KILO42..\n\n\n[Illustration: \u201cThe secret password is KILO",
+    "in_window": false
+  },
+  "0.75": {
+    "acc": 1.0,
+    "native_acc": 1.0,
+    "text": " KILO42. I am _all_.\nI_ever_ever_ever_.\u201d\n",
+    "native_text": " KILO42. 1. 2. 3. 4. 5.",
+    "in_window": false
+  }
+}

@@ -5,6 +5,7 @@ V = W(K_pre) + dequantize(V_residual). No fp16 V storage.
 """
 import torch
 import torch.nn.functional as F
+import numpy as np
 
 # Lazy-loaded CUDA kernel (compiled once on first use)
 _kvr_cuda_fn = None
@@ -37,11 +38,13 @@ def _reverse_rotary(x, cos, sin):
 
 
 class RetrievalIndex:
-    def __init__(self, n_kv, d_head, top_k=128, device='cuda'):
+    def __init__(self, n_kv, d_head, top_k=128, device='cuda', chunk_size=8):
         self.n_kv = n_kv
         self.d_head = d_head
         self.kv_dim = n_kv * d_head
         self.top_k = top_k
+        self.chunk_size = chunk_size
+        self.top_per_basin = 16
         self.device = device
         self.k_scales = None
         self.k_packed = None        # (n, n_kv, d//2) uint8, 2 int4 per byte
@@ -53,6 +56,9 @@ class RetrievalIndex:
         self.V_mean = None
         self.cos = None
         self.sin = None
+        self.n_attractors = 128
+        self.attractors = None   # (n_attractors, d) cluster centroids
+        self.labels = None       # (n_stored,) cluster ID per token
 
     def set_rotary_tables(self, cos, sin):
         self.cos = cos
@@ -118,7 +124,7 @@ class RetrievalIndex:
     def _deq_k(self, kvh):
         """Dequantize K_pre for one KV head from bit-packed uint8."""
         step = 2 * self.k_scales / 16
-        packed = self.k_packed[:, kvh, :]  # (n_stored, d//2) uint8
+        packed = self.k_packed[:self.n_stored, kvh, :]  # (n_stored, d//2) uint8
         unpacked = self._unpack_int4(packed).float()
         return unpacked * step[kvh].float()
 
@@ -130,9 +136,9 @@ class RetrievalIndex:
     def _rotary(self, k_pre_2d, indices):
         if self.cos is None:
             return k_pre_2d
-        return _apply_rotary(k_pre_2d,
-                             self.cos[indices].to(k_pre_2d.dtype),
-                             self.sin[indices].to(k_pre_2d.dtype))
+        c = self.cos[indices].squeeze(1).to(k_pre_2d.dtype)
+        s = self.sin[indices].squeeze(1).to(k_pre_2d.dtype)
+        return _apply_rotary(k_pre_2d, c, s)
 
     def _reconstruct_v(self, k_pre_top, top_idx):
         kv_flat = k_pre_top.reshape(-1, self.kv_dim)
@@ -226,25 +232,86 @@ class RetrievalIndex:
         return out
 
     @torch.no_grad()
+    def build_attractors(self):
+        """K-means on deq'd K vectors to build attractor basins."""
+        from sklearn.cluster import MiniBatchKMeans
+        nr = self.n_stored
+        if nr < self.n_attractors * 2:
+            return
+        # Gather K for all heads (use first head as proxy)
+        kp = self._deq_k(0).float().cpu().numpy()
+        kmeans = MiniBatchKMeans(n_clusters=self.n_attractors, random_state=42,
+                                 batch_size=min(1024, nr), n_init=1)
+        self.labels = torch.from_numpy(kmeans.fit_predict(kp)).to(self.device)
+        self.attractors = torch.from_numpy(kmeans.cluster_centers_.astype(np.float32)).to(self.device)
+
+    @torch.no_grad()
+    def compute_attractor_scores(self, q_post_rope):
+        """Score attractor centroids instead of individual tokens."""
+        d = self.d_head; n_kv = self.n_kv; na = self.attractors.shape[0]
+        g = q_post_rope.shape[0] // n_kv
+        if self.attractors is None:
+            return self.compute_all_scores(q_post_rope)
+        # Take the first GQA group's query as proxy
+        q_avg = q_post_rope.view(n_kv, g, d).mean(dim=1)
+        # Score against attractor centroids
+        scores = torch.empty(na, n_kv, device=self.device)
+        for kvh in range(min(1, n_kv)):  # use head 0 as proxy
+            qn = q_avg[kvh] / (q_avg[kvh].norm() + 1e-8)
+            an = self.attractors / (self.attractors.norm(dim=-1, keepdim=True) + 1e-8)
+            scores[:, kvh] = qn @ an.T
+        return scores
+
+    @torch.no_grad()
     def compute_all_scores(self, q_post_rope):
         """Compute Q·K scores for all stored tokens × KV heads."""
         d = self.d_head; n_kv_ret = self.n_kv; n_stored_ret = self.n_stored
         g = q_post_rope.shape[0] // n_kv_ret
         q_avg = q_post_rope.view(n_kv_ret, g, d).mean(dim=1)
 
-        try:
-            result = _cuda_compute_scores(q_avg, self.k_packed, self.k_scales, self.cos, self.sin)
-            if result is not None:
-                return result
-        except Exception:
-            pass
+        # try:
+        #     result = _cuda_compute_scores(q_avg, self.k_packed, self.k_scales, self.cos, self.sin)
+        #     if result is not None:
+        #         return result
+        # except Exception:
+        #     pass
 
         scores = torch.empty(n_stored_ret, n_kv_ret, device=self.device)
         aidx = torch.arange(n_stored_ret, device=self.device)
         for kvh in range(n_kv_ret):
             kp = self._deq_k(kvh)
             kp2 = self._rotary(kp, aidx)
-            scores[:, kvh] = (q_avg[kvh] @ kp2.T) / (d ** 0.5)
+            qn = q_avg[kvh] / (q_avg[kvh].norm() + 1e-8)
+            kn = kp2 / (kp2.norm(dim=-1, keepdim=True) + 1e-8)
+            scores[:, kvh] = qn @ kn.T
+        if torch.isnan(scores).any():
+            scores[torch.isnan(scores)] = float('-inf')
+        return scores
+
+    @torch.no_grad()
+    def compute_chunk_scores(self, q_post_rope):
+        """Chunk-level scores: group consecutive tokens into chunks, score chunk mean."""
+        d = self.d_head; n_kv = self.n_kv; nr = self.n_stored; cs = self.chunk_size
+        g = q_post_rope.shape[0] // n_kv
+        q_avg = q_post_rope.view(n_kv, g, d).mean(dim=1)
+        n_chunks = nr // cs
+        if n_chunks < 1:
+            return self.compute_all_scores(q_post_rope)
+
+        aidx = torch.arange(nr, device=self.device)
+        # Load all K pre-RoPE for one head at a time, then chunk-mean
+        scores = torch.empty(n_chunks, n_kv, device=self.device)
+        for kvh in range(n_kv):
+            kp = self._deq_k(kvh)
+            kp_r = self._rotary(kp, aidx)
+            # Reshape into chunks and mean pool
+            k_flat = kp_r[:n_chunks * cs].view(n_chunks, cs, d)
+            k_chunk = k_flat.mean(dim=1)
+            qn = q_avg[kvh] / (q_avg[kvh].norm() + 1e-8)
+            kn = k_chunk / (k_chunk.norm(dim=-1, keepdim=True) + 1e-8)
+            scores[:, kvh] = qn @ kn.T
+        if torch.isnan(scores).any():
+            scores[torch.isnan(scores)] = float('-inf')
         return scores
 
     @torch.no_grad()
@@ -261,10 +328,68 @@ class RetrievalIndex:
         top_k = min(self.top_k, nr)
         all_idx = torch.arange(nr, device=self.device)
 
-        # Triton-accelerated scores: (nr, n_kv)
-        scores = self.compute_all_scores(q_post_rope)
-        scores[exclude_start:exclude_end, :] = float('-inf')
-        top_indices = torch.topk(scores, top_k, dim=0)[1]  # (top_k, n_kv)
+        # Use attractor-level scoring if available
+        if self.attractors is not None and self.labels is not None:
+            scores = self.compute_attractor_scores(q_post_rope)
+            na = scores.shape[0]
+            top_a = min(48, na)  # select ~48 clusters × ~124 tok ≈ ~6000 tok
+            # Select top attractors
+            top_aidx = torch.topk(scores[:, 0], top_a, dim=0)[1]
+            # Per-basin top-16 token selection with token-level scoring
+            if q_post_rope is not None:
+                d = self.d_head; n_kv = self.n_kv
+                g = q_post_rope.shape[0] // n_kv
+                q_avg = q_post_rope.view(n_kv, g, d).mean(dim=1)
+            all_tidx = []
+            for aidx in top_aidx:
+                mask = (self.labels == aidx)
+                tidx = mask.nonzero(as_tuple=True)[0]
+                if tidx.shape[0] <= self.top_per_basin:
+                    all_tidx.append(tidx)
+                else:
+                    kp = self._deq_k(0)[tidx]
+                    kp_rot = self._rotary(kp, tidx)
+                    kn = kp_rot / (kp_rot.norm(dim=-1, keepdim=True) + 1e-8)
+                    qn = q_avg[0] / (q_avg[0].norm() + 1e-8)
+                    tok_scores = qn @ kn.T
+                    top_local = tok_scores.argsort(descending=True)[:self.top_per_basin]
+                    all_tidx.append(tidx[top_local])
+            all_tidx = torch.cat(all_tidx) if all_tidx else torch.zeros(0, device=self.device, dtype=torch.long)
+            # Deduplicate and keep order
+            all_tidx = torch.unique(all_tidx)
+            top_k = all_tidx.shape[0]
+            # Apply exclude range
+            if exclude_end > exclude_start:
+                mask = (all_tidx < exclude_start) | (all_tidx >= exclude_end)
+                all_tidx = all_tidx[mask]
+            if all_tidx.shape[0] == 0:
+                return empty
+            top_indices = all_tidx.unsqueeze(1).expand(-1, self.n_kv)  # (n_tok, n_kv)
+
+        # Use chunk-level scoring if applicable
+        elif self.chunk_size > 0 and nr >= self.chunk_size * 2:
+            n_chunks = scores.shape[0]
+            # Convert exclude range to chunk indices
+            ec_start = exclude_start // cs
+            ec_end = min((exclude_end + cs - 1) // cs, n_chunks)
+            if ec_start >= ec_end: ec_start = ec_end = 0
+            if ec_start < n_chunks:
+                scores[ec_start:ec_end, :] = float('-inf')
+            top_chunks = min(max(1, top_k // cs), n_chunks)
+            chunk_idx = torch.topk(scores, top_chunks, dim=0)[1]  # (top_chunks, n_kv)
+            # Expand each chunk to all its constituent token indices
+            expanded = []
+            for kvh in range(self.n_kv):
+                cidx = chunk_idx[:, kvh]
+                # For each chunk, generate token indices from c*cs to (c+1)*cs
+                tok_idx = cidx.unsqueeze(-1) * cs + torch.arange(cs, device=self.device)
+                expanded.append(tok_idx.reshape(-1))
+            top_indices = torch.stack(expanded, dim=1)  # (top_k, n_kv)
+            top_k = top_indices.shape[0]
+        else:
+            scores = self.compute_all_scores(q_post_rope)
+            scores[exclude_start:exclude_end, :] = float('-inf')
+            top_indices = torch.topk(scores, top_k, dim=0)[1]  # (top_k, n_kv)
 
         # Batch V reconstruction: one W@K matmul for all unique tokens
         all_tidx = top_indices.T.reshape(-1)  # (n_kv * top_k,)

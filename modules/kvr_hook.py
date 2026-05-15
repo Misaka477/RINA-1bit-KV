@@ -4,6 +4,7 @@ via forward hooks. Lazy retrieval: only built when context > window_size.
 No LLaMA-specific imports - compatible with any HuggingFace model.
 """
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from .kvr_window import WindowBuffer
 from .kvr_retrieval import RetrievalIndex, _apply_rotary, _reverse_rotary
@@ -23,6 +24,7 @@ class KVRHook:
         self.window_size = window_size
         self.top_k = top_k
         self._ret_weight = ret_weight
+        self.num_denoise_steps = kwargs.get('num_denoise_steps', 3)
 
         self._context_len = 0
         self._prefill_done = False
@@ -30,9 +32,18 @@ class KVRHook:
         self._step = 0
         self._retrieval_built = False
 
+        self.chunk_size = kwargs.get('chunk_size', 0)
+        self.warmup_mode = kwargs.get('warmup_mode', False)
+        self.calib_native = [[] for _ in range(self.n_layers)]
+        self.calib_kvr = [[] for _ in range(self.n_layers)]
+        self.calib_s = None
+        self.calib_b = None
+        self.mlp_adapter_data = [[] for _ in range(self.n_layers)]
+        self.adapters = [None] * self.n_layers  # 0 = disabled
         self.windows = [WindowBuffer(self.n_kv, self.d_head, window_size, self.device)
                         for _ in range(self.n_layers)]
-        self.retrievals = [RetrievalIndex(self.n_kv, self.d_head, top_k, device=self.device)
+        self.retrievals = [RetrievalIndex(self.n_kv, self.d_head, top_k, device=self.device,
+                                           chunk_size=self.chunk_size)
                            for _ in range(self.n_layers)]
 
         max_pos = cfg.max_position_embeddings
@@ -93,7 +104,7 @@ class KVRHook:
             h = attn.register_forward_hook(make_hook(li, captured_k, captured_v), with_kwargs=True)
             prefill_hooks.append(h)
 
-        self.model(input_ids)
+        self.model(input_ids, num_logits_to_keep=1)
 
         for h in prefill_hooks:
             h.remove()
@@ -119,6 +130,7 @@ class KVRHook:
                 k_pre = captured_k[li]; v = captured_v[li]
                 self.retrievals[li].calibrate(k_pre, v)
                 self.retrievals[li].batch_append(k_pre[:n_ret], v[:n_ret])
+                self.retrievals[li].build_attractors()
             self._retrieval_built = True
 
     def _update_stores(self, li, k_pre, v_val, k_post):
@@ -142,10 +154,73 @@ class KVRHook:
                 self._make_hook(li), with_kwargs=True)
             self._hooks.append(hook)
 
+    def fit_calibration(self):
+        """Fit per-layer diagonal linear correction s, b from warmup data.
+        nat[d] ≈ s[d] * kvr[d] + b[d]  (one scalar per dimension)
+        """
+        self.calib_s = [None] * self.n_layers
+        self.calib_b = [None] * self.n_layers
+        for li in range(self.n_layers):
+            kvr = torch.stack(self.calib_kvr[li]).float()  # (N, d)
+            nat = torch.stack(self.calib_native[li]).float()  # (N, d)
+            # Closed-form OLS per dimension
+            mk = kvr.mean(dim=0); mn = nat.mean(dim=0)
+            kc = kvr - mk; nc = nat - mn
+            s = (kc * nc).sum(dim=0) / ((kc ** 2).sum(dim=0) + 1e-8)
+            b = mn - s * mk
+            self.calib_s[li] = s  # (d,)
+            self.calib_b[li] = b  # (d,)
+
+    def fit_mlp_adapters(self, lr=0.01, epochs=200):
+        """Train per-layer 2-layer MLP adapters to map KVR MLP input toward native."""
+        self.adapters = [None] * self.n_layers
+        for li in range(self.n_layers):
+            if len(self.mlp_adapter_data[li]) < 3:
+                continue
+            kvr = torch.stack([x[0] for x in self.mlp_adapter_data[li]]).float()
+            nat = torch.stack([x[1] for x in self.mlp_adapter_data[li]]).float()
+            if kvr.shape[0] < 3:
+                continue
+            d = kvr.shape[-1]
+            adapter = nn.Sequential(
+                nn.Linear(d, 16), nn.ReLU(), nn.Linear(16, d)).to(kvr.device)
+            opt = torch.optim.Adam(adapter.parameters(), lr=lr)
+            for _ in range(epochs):
+                out = adapter(kvr)
+                loss = nn.functional.mse_loss(out, nat)
+                opt.zero_grad(); loss.backward(); opt.step()
+            self.adapters[li] = adapter.cpu()
+            print(f"  Layer {li}: adapter loss = {loss.item():.6f}")
+
+    def register_mlp_hooks(self):
+        self._mlp_hooks = []
+        for li in range(self.n_layers):
+            if self.adapters[li] is None:
+                continue
+            mlp_mod = self.model.model.layers[li].mlp
+            adp = self.adapters[li].to(self.device)
+            registered = [True]
+            def make_hook(adp_mod, hook_registered):
+                def hook(mod, args, output):
+                    if not hook_registered[0]:
+                        return output
+                    hook_registered[0] = False
+                    x = adp_mod(args[0].float()).half()
+                    result = mod.__class__.forward(mod, x)
+                    hook_registered[0] = True
+                    return result
+                return hook
+            h = mlp_mod.register_forward_hook(make_hook(adp, registered))
+            self._mlp_hooks.append(h)
+
     def remove(self):
         for h in self._hooks:
             h.remove()
         self._hooks = []
+        if hasattr(self, '_mlp_hooks'):
+            for h in self._mlp_hooks:
+                h.remove()
+            self._mlp_hooks = []
 
     def _make_hook(self, li):
         attn_mod = self.model.model.layers[li].self_attn
@@ -208,6 +283,29 @@ class KVRHook:
 
             fwr_proj = mod.o_proj(out.half().reshape(1, -1))
 
+            # Iterative MLP refinement with proper residual
+            if self.num_denoise_steps > 0 and not self.warmup_mode:
+                h_in = kwargs['hidden_states'][:, -1:, :].half()
+                h = h_in + fwr_proj
+                layer_mod = self.model.model.layers[li]
+                for _ in range(self.num_denoise_steps):
+                    h = h + layer_mod.mlp(layer_mod.post_attention_layernorm(h))
+                fwr_proj = h - h_in  # subtract h_in so model's residual gives h
+
+            if self.warmup_mode:
+                h_in = kwargs['hidden_states'][:, -1:, :].half()
+                layer_mod = self.model.model.layers[li]
+                h_native = layer_mod.post_attention_layernorm(h_in.squeeze(0) + output[0][:, -1, :])
+                h_kvr = layer_mod.post_attention_layernorm(h_in.squeeze(0) + fwr_proj)
+                self.mlp_adapter_data[li].append((h_kvr.detach().cpu(), h_native.detach().cpu()))
+                return output
+
+            # Apply calibration if available
+            if self.calib_s is not None:
+                s = self.calib_s[li].to(fwr_proj.device)
+                b = self.calib_b[li].to(fwr_proj.device)
+                fwr_proj = fwr_proj * s + b
+
             new_attn = output[0].clone()
             new_attn[:, -1, :] = fwr_proj
             extra = tuple(output[i] for i in range(1, len(output)))
@@ -223,7 +321,8 @@ class KVRHook:
         self.remove()
         self.windows = [WindowBuffer(self.n_kv, self.d_head, self.window_size, self.device)
                         for _ in range(self.n_layers)]
-        self.retrievals = [RetrievalIndex(self.n_kv, self.d_head, self.top_k, device=self.device)
+        self.retrievals = [RetrievalIndex(self.n_kv, self.d_head, self.top_k, device=self.device,
+                                           chunk_size=self.chunk_size)
                            for _ in range(self.n_layers)]
 
     def __repr__(self):

@@ -1,0 +1,69 @@
+{
+  "groups": {
+    "1_cluster_sweep": [
+      {
+        "n_clusters": 128,
+        "needle_rank": 40,
+        "avg_tok": 124.1,
+        "total_tok": 4963.0
+      },
+      {
+        "n_clusters": 256,
+        "needle_rank": 124,
+        "avg_tok": 62.0,
+        "total_tok": 7693.0
+      },
+      {
+        "n_clusters": 512,
+        "needle_rank": 359,
+        "avg_tok": 31.0,
+        "total_tok": 11137.0
+      },
+      {
+        "n_clusters": 1024,
+        "needle_rank": 700,
+        "avg_tok": 15.5,
+        "total_tok": 10858.0
+      }
+    ],
+    "2_basin_count": [
+      {
+        "top_basins": 10,
+        "needle_found": false,
+        "total_tok": 620.0
+      },
+      {
+        "top_basins": 20,
+        "needle_found": false,
+        "total_tok": 1241.0
+      },
+      {
+        "top_basins": 30,
+        "needle_found": false,
+        "total_tok": 1861.0
+      },
+      {
+        "top_basins": 50,
+        "needle_found": false,
+        "total_tok": 3102.0
+      }
+    ],
+    "4_best_combo": [
+      {
+        "depth": 0.25,
+        "niah_pass": true,
+        "text": " KILO42. 1. 2 am _so_ _my_ _my_ _my_ _my_ _my_ _my_ _my_ _B_ _B_ _B_ _B_ _B_"
+      },
+      {
+        "depth": 0.5,
+        "niah_pass": true,
+        "text": " KILO42..\n\n\n[Illustrally, I am to be--_\u2014_\u2014_\u2014_\u2014_\u2014_\u2014_\u2014_\u2014_\u2014_\u2014_\u2014_\u2014_\u2014_\u2014_\u2014_\u2014_"
+      },
+      {
+        "depth": 0.75,
+        "niah_pass": true,
+        "text": " KILO42. 1. 2 and her sisters, sir Lucas, sir Lucas, sir Lucas, sir Lucas, Lucas, sir, Lucas, and Lucas, and Sir, and I, sir, sir, Lucas, Lucas, Lucas"
+      }
+    ]
+  }
+}

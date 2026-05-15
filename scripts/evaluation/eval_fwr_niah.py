@@ -1,5 +1,6 @@
+# -*- coding: latin-1 -*-
 """
-FWR NIAH �?Needle In A Haystack, 验证检索能否从长上下文(>window)中找到特定事实�?改进：使用填空题格式�?B 模型对问答题响应差），更短的干草堆句�?"""
+FWR NIAH - Needle In A Haystack test."""
 import os, sys, json, argparse, torch
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -91,7 +92,7 @@ def main():
                             cur = seq_t
                         else:
                             cur = torch.cat([seq_t] + gen_ids, dim=1)
-                        out2 = model(cur, use_cache=False)
+                        out2 = model(cur, use_cache=False, num_logits_to_keep=1)
                         nid = out2.logits[:, -1, :].argmax(dim=-1, keepdim=True)
                         gen_ids.append(nid)
                         fwr._step += 1
@@ -119,7 +120,7 @@ def main():
 
     # Summary
     print(f"\n{'='*70}")
-    print("NIAH SUMMARY �?Accuracy")
+    print("=== NIAH SUMMARY ===")
     header = f"{'ctx':>5s}  {'depth':>5s}  {'native':>7s}"
     for ws in args.window_sizes:
         header += f"  {'win'+str(ws):>7s}"
